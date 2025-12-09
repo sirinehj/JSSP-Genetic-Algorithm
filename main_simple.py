@@ -1,3 +1,4 @@
+# main_simple.py (version avec Gantt amélioré)
 import time
 from Chromosome import load_tasks, genetic_algorithm, plot_gantt_chart, plot_convergence, save_solution_stats
 import os
@@ -18,7 +19,7 @@ def main():
         return
     
     # Chercher un fichier spécifique
-    target_file = "tasks_small.json"  # Changez ceci selon vos besoins
+    target_file = "tasks_small.json"
     
     print(f"\n🔍 Recherche du fichier: {data_dir}/{target_file}")
     
@@ -57,24 +58,25 @@ def main():
     if total_ops <= 50:
         population = 20
         generations = 30
-        print(f"\n⚙️  Mode: TEST RAPIDE")
+        mode = "TEST RAPIDE"
     elif total_ops <= 200:
         population = 30
         generations = 50
-        print(f"\n⚙️  Mode: PETIT DATASET")
+        mode = "PETIT DATASET"
     elif total_ops <= 1000:
         population = 50
         generations = 80
-        print(f"\n⚙️  Mode: DATASET MOYEN")
+        mode = "DATASET MOYEN"
     elif total_ops <= 5000:
         population = 70
         generations = 100
-        print(f"\n⚙️  Mode: GRAND DATASET")
+        mode = "GRAND DATASET"
     else:
         population = 80
         generations = 120
-        print(f"\n⚙️  Mode: TRÈS GRAND DATASET")
+        mode = "TRÈS GRAND DATASET"
     
+    print(f"\n⚙️  Mode: {mode}")
     print(f"   Population: {population}")
     print(f"   Générations: {generations}")
     
@@ -107,24 +109,35 @@ def main():
         print(f"🎯 Makespan: {best_solution.makespan:.2f}")
         print(f"📈 Fitness: {best_solution.fitness:.6f}")
         
+        # Générer un nom de base
+        base_name = os.path.splitext(target_file)[0]
+        
         # Sauvegarder
         print(f"\n💾 Sauvegarde des résultats...")
-        save_solution_stats(best_solution, tasks, 'solution_stats.txt')
+        save_solution_stats(best_solution, tasks, f'{base_name}_stats.txt')
         
-        # Visualisations (seulement pour datasets moyens/petits)
-        if total_ops <= 500:
+        # Visualisations adaptatives
+        if total_ops <= 1000:  # Augmenté à 1000
             print(f"\n🎨 Génération des graphiques...")
-            plot_gantt_chart(best_solution, tasks, job_ids, 'gantt.png')
-            plot_convergence(best_history, avg_history, 'convergence.png')
-        elif total_ops <= 2000:
+            plot_gantt_chart(best_solution, tasks, job_ids, f'{base_name}_gantt.png')
+            plot_convergence(best_history, avg_history, f'{base_name}_convergence.png')
+        elif total_ops <= 5000:
             print(f"\n🎨 Génération du graphique de convergence...")
-            plot_convergence(best_history, avg_history, 'convergence.png')
-            print("⚠️  Diagramme de Gantt ignoré (trop de données)")
+            plot_convergence(best_history, avg_history, f'{base_name}_convergence.png')
+            print("⚠️  Diagramme de Gantt ignoré (trop de données pour une visualisation claire)")
         else:
             print(f"\n⚠️  Visualisations ignorées (dataset trop grand)")
         
+        # Résumé
         print(f"\n{'='*70}")
-        print("✅ EXÉCUTION TERMINÉE")
+        print("📁 FICHIERS GÉNÉRÉS DANS 'Results/'")
+        print(f"{'='*70}")
+        print(f"• {base_name}_stats.txt - Statistiques détaillées")
+        if total_ops <= 1000:
+            print(f"• {base_name}_gantt.png - Diagramme de Gantt")
+            print(f"• {base_name}_convergence.png - Graphique de convergence")
+        elif total_ops <= 5000:
+            print(f"• {base_name}_convergence.png - Graphique de convergence")
         print(f"{'='*70}")
         
     except KeyboardInterrupt:
