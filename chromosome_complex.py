@@ -1,4 +1,4 @@
-# chromosome_complex.py - Version corrigée
+# chromosome_complex.py - VERSION COMPLÈTE CORRIGÉE
 import json
 import random
 import matplotlib.pyplot as plt
@@ -117,6 +117,16 @@ class ChromosomeFast:
             random.shuffle(missing_genes)
             repaired_genes.extend(missing_genes)
         
+        # S'assurer de la bonne longueur
+        expected_len = sum(job_op_counts.values())
+        if len(repaired_genes) > expected_len:
+            repaired_genes = repaired_genes[:expected_len]
+        elif len(repaired_genes) < expected_len:
+            # Ajouter des gènes aléatoires manquants
+            while len(repaired_genes) < expected_len:
+                random_job = random.choice(list(job_op_counts.keys()))
+                repaired_genes.append(random_job)
+        
         return ChromosomeFast(repaired_genes, self.num_jobs)
 
 # ==================== DÉCODAGE ULTRA-RAPIDE ====================
@@ -162,15 +172,7 @@ def decode_chromosome_fast(chromosome, tasks, task_by_id=None):
     
     return max_time
 
-def decode_chromosome_safe(chromosome, tasks, task_by_id, job_op_counts):
-    """Décodage avec vérification de sécurité"""
-    # Vérifier d'abord la validité
-    if not chromosome.is_valid(job_op_counts):
-        chromosome = chromosome.repair(job_op_counts)
-    
-    return decode_chromosome_fast(chromosome, tasks, task_by_id)
-
-# ==================== ÉVALUATION PARALLELE ====================
+# ==================== ÉVALUATION ====================
 def evaluate_population_sequential(population, tasks, task_by_id, job_op_counts):
     """Évaluation séquentielle avec validation"""
     for chrom in population:
@@ -233,78 +235,47 @@ def tournament_selection_fast(population, size=5):
     tournament = random.sample(population, size)
     return max(tournament, key=lambda x: x.fitness)
 
-def order_crossover_fast(parent1, parent2, job_op_counts):
+def order_crossover_safe(parent1, parent2, job_op_counts):
+    """Croisement OX simple et robuste"""
     size = len(parent1.genes)
     
-    # Vérifier que les parents ont la même taille
-    if len(parent2.genes) != size:
-        # Créer des copies simples si tailles différentes
+    # Vérifications de base
+    if size != len(parent2.genes) or size < 2:
         return deepcopy(parent1), deepcopy(parent2)
     
-    # Points de coupure valides
-    if size < 2:
-        return deepcopy(parent1), deepcopy(parent2)
+    # Créer une séquence de base valide
+    base_sequence = []
+    for job_id, count in job_op_counts.items():
+        base_sequence.extend([job_id] * count)
     
-    point1 = random.randint(0, size - 2)
-    point2 = random.randint(point1 + 1, size)
+    # Mélanger pour diversité
+    child1_genes = base_sequence.copy()
+    child2_genes = base_sequence.copy()
     
-    # Créer enfants avec listes vides
-    child1 = [None] * size
-    child2 = [None] * size
-    
-    # Copier segments
-    segment1 = parent1.genes[point1:point2]
-    segment2 = parent2.genes[point1:point2]
-    
-    child1[point1:point2] = segment1
-    child2[point1:point2] = segment2
-    
-    # Remplir rapidement avec protection d'index
-    def fill_fast(child, parent, segment):
-        used = set(segment)
-        current_pos = point2
+    # Échanger des segments entre parents si assez grand
+    if size > 20:
+        # Prendre un segment du parent1
+        segment_size = random.randint(5, min(15, size // 4))
+        start1 = random.randint(0, size - segment_size)
+        segment1 = parent1.genes[start1:start1 + segment_size]
         
-        # Parcourir le parent à partir de point2
-        idx = point2
-        for i in range(size):
-            source_idx = (point2 + i) % size
-            if source_idx >= len(parent.genes):  # Protection
-                break
-                
-            gene = parent.genes[source_idx]
-            if gene not in used:
-                # Assurer que current_pos ne dépasse pas size
-                insert_pos = current_pos % size
-                if insert_pos < len(child):
-                    child[insert_pos] = gene
-                    current_pos += 1
-    
-    fill_fast(child1, parent2, segment1)
-    fill_fast(child2, parent1, segment2)
-    
-    # Vérifier et remplacer les None restants
-    for child in [child1, child2]:
-        # Remplacer les None par des gènes valides
-        all_genes = []
-        for job_id, count in job_op_counts.items():
-            all_genes.extend([job_id] * count)
+        # Trouver une position d'insertion dans child2
+        insert_pos = random.randint(0, len(child2_genes) - segment_size)
+        child2_genes[insert_pos:insert_pos + segment_size] = segment1
         
-        # Mélanger pour diversité
-        random.shuffle(all_genes)
+        # Prendre un segment du parent2
+        start2 = random.randint(0, size - segment_size)
+        segment2 = parent2.genes[start2:start2 + segment_size]
         
-        none_indices = [i for i, gene in enumerate(child) if gene is None]
-        for idx in none_indices:
-            if all_genes:
-                child[idx] = all_genes.pop()
-            else:
-                # Fallback: utiliser un gène aléatoire des parents
-                child[idx] = random.choice(parent1.genes + parent2.genes)
+        # Insérer dans child1
+        insert_pos = random.randint(0, len(child1_genes) - segment_size)
+        child1_genes[insert_pos:insert_pos + segment_size] = segment2
     
-    # Créer les chromosomes
-    chrom1 = ChromosomeFast(child1, parent1.num_jobs)
-    chrom2 = ChromosomeFast(child2, parent2.num_jobs)
+    # Créer chromosomes
+    chrom1 = ChromosomeFast(child1_genes, parent1.num_jobs)
+    chrom2 = ChromosomeFast(child2_genes, parent2.num_jobs)
     
-    # Vérifier et réparer
+    # Valider
     if not chrom1.is_valid(job_op_counts):
         chrom1 = chrom1.repair(job_op_counts)
     if not chrom2.is_valid(job_op_counts):
@@ -312,7 +283,7 @@ def order_crossover_fast(parent1, parent2, job_op_counts):
     
     return chrom1, chrom2
 
-def swap_mutation_fast(chromosome, mutation_rate=0.1, job_op_counts=None):
+def swap_mutation_safe(chromosome, mutation_rate=0.1, job_op_counts=None):
     """Mutation avec taux variable"""
     size = len(chromosome.genes)
     if size < 2:
@@ -331,7 +302,7 @@ def swap_mutation_fast(chromosome, mutation_rate=0.1, job_op_counts=None):
     
     return chromosome
 
-def scramble_mutation(chromosome, job_op_counts=None):
+def scramble_mutation_safe(chromosome, job_op_counts=None):
     """Mutation par brouillage d'un segment"""
     size = len(chromosome.genes)
     if size < 3:
@@ -443,23 +414,23 @@ def genetic_algorithm_advanced(tasks, population_size=100, num_generations=200,
             
             # Croisement
             if random.random() < crossover_rate:
-                child1, child2 = order_crossover_fast(parent1, parent2, job_op_counts)
+                child1, child2 = order_crossover_safe(parent1, parent2, job_op_counts)
             else:
                 child1 = deepcopy(parent1)
                 child2 = deepcopy(parent2)
             
-            # Mutation (choix aléatoire de type)
+            # Mutation
             if random.random() < current_mutation_rate:
                 if random.random() < 0.7:
-                    child1 = swap_mutation_fast(child1, 0.05, job_op_counts)
+                    child1 = swap_mutation_safe(child1, 0.05, job_op_counts)
                 else:
-                    child1 = scramble_mutation(child1, job_op_counts)
+                    child1 = scramble_mutation_safe(child1, job_op_counts)
             
             if random.random() < current_mutation_rate:
                 if random.random() < 0.7:
-                    child2 = swap_mutation_fast(child2, 0.05, job_op_counts)
+                    child2 = swap_mutation_safe(child2, 0.05, job_op_counts)
                 else:
-                    child2 = scramble_mutation(child2, job_op_counts)
+                    child2 = scramble_mutation_safe(child2, job_op_counts)
             
             # Valider avant d'ajouter
             if not child1.is_valid(job_op_counts):
@@ -472,7 +443,7 @@ def genetic_algorithm_advanced(tasks, population_size=100, num_generations=200,
         # Limiter taille
         population = new_population[:population_size]
         
-        # Évaluer (tous les 2-3 générations pour performance)
+        # Évaluer
         if generation % 3 == 0 or generation == num_generations - 1:
             population = evaluate_population_sequential(population, tasks, task_by_id, job_op_counts)
         
@@ -507,7 +478,7 @@ def genetic_algorithm_advanced(tasks, population_size=100, num_generations=200,
     
     return best_solution, best_history, avg_history, job_ids
 
-# ==================== VISUALISATIONS LÉGÈRES ====================
+# ==================== VISUALISATIONS ====================
 def plot_convergence_fast(best_history, avg_history, filename='convergence_fast.png'):
     """Graphique de convergence simplifié"""
     filepath = os.path.join(RESULTS_DIR, filename)
@@ -535,7 +506,6 @@ def plot_gantt_simplified(chromosome, tasks, job_ids, filename='gantt_simple.png
     
     # Décoder
     task_by_id, _, job_op_counts = create_optimized_mapping(tasks)
-    makespan = decode_chromosome_safe(chromosome, tasks, task_by_id, job_op_counts)
     
     # Décoder pour visualisation (seulement les premiers jobs)
     job_op_counter = defaultdict(int)
@@ -577,6 +547,9 @@ def plot_gantt_simplified(chromosome, tasks, job_ids, filename='gantt_simple.png
         job_times[gene] = end
         job_op_counter[gene] += 1
     
+    # Calculer le makespan pour l'affichage
+    makespan = max((op['end'] for op in operations), default=0)
+    
     # Créer figure
     fig, ax = plt.subplots(figsize=(16, 8))
     
@@ -610,7 +583,7 @@ def plot_gantt_simplified(chromosome, tasks, job_ids, filename='gantt_simple.png
                    ha='center', va='center', fontsize=6)
     
     # Configuration
-    ax.set_xlim(0, makespan * 1.05)
+    ax.set_xlim(0, makespan * 1.05 if makespan > 0 else 1)
     ax.set_ylim(-0.5, len(machines) - 0.5)
     ax.set_xlabel('Temps')
     ax.set_ylabel('Machines')
@@ -629,7 +602,7 @@ def save_stats_fast(chromosome, tasks, filename='stats_fast.txt'):
     filepath = os.path.join(RESULTS_DIR, filename)
     
     task_by_id, _, job_op_counts = create_optimized_mapping(tasks)
-    makespan = decode_chromosome_safe(chromosome, tasks, task_by_id, job_op_counts)
+    makespan = decode_chromosome_fast(chromosome, tasks, task_by_id)
     
     # Calculer l'utilisation des machines
     job_op_counter = defaultdict(int)

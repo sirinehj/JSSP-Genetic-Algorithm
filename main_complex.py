@@ -1,9 +1,5 @@
-# main_complex.py
 import time
 import os
-import sys
-
-from chromosome_complex import plot_convergence_fast, plot_gantt_simplified, save_stats_fast
 
 def main():
     print("\n" + "="*80)
@@ -19,9 +15,9 @@ def main():
             plot_gantt_simplified,
             save_stats_fast
         )
-    except ImportError:
-        print("❌ Impossible d'importer chromosome_complex.py")
-        print("   Assurez-vous qu'il est dans le même dossier")
+    except ImportError as e:
+        print(f"❌ Erreur d'import: {e}")
+        print("   Assurez-vous que chromosome_complex.py est dans le même dossier")
         return
     
     # Vérifier data/
@@ -41,155 +37,72 @@ def main():
     for i, f in enumerate(json_files, 1):
         print(f"  {i}. {f}")
     
-    print(f"  {len(json_files)+1}. Analyser avant exécution")
-    print(f"  {len(json_files)+2}. Quitter")
-    
-    choice = input("\nVotre choix: ").strip()
-    
-    if choice == str(len(json_files)+2) or choice.lower() in ['q', 'quit']:
-        return
-    
-    if choice == str(len(json_files)+1):
-        analyze_datasets(json_files)
-        return
-    
     try:
+        choice = input("\nVotre choix (numéro): ").strip()
         idx = int(choice) - 1
+        
         if 0 <= idx < len(json_files):
             selected_file = json_files[idx]
-            run_advanced_analysis(selected_file)
+            print(f"\n✅ Fichier sélectionné: {selected_file}")
+            run_advanced_analysis(selected_file, 
+                                  load_tasks_fast,
+                                  genetic_algorithm_advanced,
+                                  plot_convergence_fast,
+                                  plot_gantt_simplified,
+                                  save_stats_fast)
         else:
             print("❌ Choix invalide")
     except ValueError:
-        print("❌ Entrée invalide")
+        print("❌ Entrée invalide. Veuillez entrer un numéro.")
+    except KeyboardInterrupt:
+        print("\n⏹️  Interrompu par l'utilisateur")
 
-def analyze_datasets(files):
-    """Analyse les datasets pour recommander des paramètres"""
-    print("\n" + "="*80)
-    print("ANALYSE DES DATASETS")
-    print("="*80)
-    
-    for filename in files:
-        try:
-            from chromosome_complex import load_tasks_fast
-            tasks = load_tasks_fast(filename)
-            
-            if not tasks:
-                print(f"❌ {filename}: impossible de charger")
-                continue
-            
-            total_ops = sum(len(task['operations']) for task in tasks)
-            machines = set()
-            for task in tasks:
-                for op in task['operations']:
-                    machines.add(op['machine_id'])
-            
-            # Recommandations
-            if total_ops <= 1000:
-                rec = "FAIBLE - Utiliser chromosome.py"
-                pop, gens = 50, 80
-            elif total_ops <= 5000:
-                rec = "MOYEN - Utiliser chromosome_complex.py"
-                pop, gens = 60, 100
-            elif total_ops <= 20000:
-                rec = "ÉLEVÉ - Utiliser chromosome_complex.py avec paramètres réduits"
-                pop, gens = 40, 60
-            else:
-                rec = "TRÈS ÉLEVÉ - Nécessite échantillonnage ou cluster"
-                pop, gens = 20, 30
-            
-            print(f"\n📊 {filename}:")
-            print(f"   Jobs: {len(tasks)}")
-            print(f"   Opérations: {total_ops}")
-            print(f"   Machines: {len(machines)}")
-            print(f"   Recommandation: {rec}")
-            print(f"   Paramètres suggérés: pop={pop}, gens={gens}")
-            
-        except Exception as e:
-            print(f"❌ Erreur analyse {filename}: {str(e)}")
-
-def run_advanced_analysis(selected_file):
+def run_advanced_analysis(selected_file, 
+                         load_tasks_fast,
+                         genetic_algorithm_advanced,
+                         plot_convergence_fast,
+                         plot_gantt_simplified,
+                         save_stats_fast):
     """Exécute l'analyse avancée"""
     print(f"\n{'='*80}")
     print(f"ANALYSE AVANCÉE: {selected_file}")
     print(f"{'='*80}")
     
-    from chromosome_complex import load_tasks_fast, genetic_algorithm_advanced
-    
     # Charger
     tasks = load_tasks_fast(selected_file)
     if not tasks:
+        print("❌ Impossible de charger les tâches")
         return
     
     print(f"✓ Jobs chargés: {len(tasks)}")
     
     # Calculer stats
     total_ops = sum(len(task['operations']) for task in tasks)
-    unique_machines = set()
-    max_ops_per_job = 0
-    min_ops_per_job = float('inf')
-    
-    for task in tasks:
-        ops = len(task['operations'])
-        max_ops_per_job = max(max_ops_per_job, ops)
-        min_ops_per_job = min(min_ops_per_job, ops)
-        for op in task['operations']:
-            unique_machines.add(op['machine_id'])
-    
     print(f"✓ Opérations totales: {total_ops}")
-    print(f"✓ Machines uniques: {len(unique_machines)}")
-    print(f"✓ Opérations par job: {min_ops_per_job}-{max_ops_per_job}")
-    
-    # Estimer complexité
-    complexity_factor = total_ops * len(unique_machines) / 1000
-    if complexity_factor < 10:
-        complexity = "FAIBLE"
-        est_time = "1-5 minutes"
-    elif complexity_factor < 50:
-        complexity = "MOYENNE"
-        est_time = "5-15 minutes"
-    elif complexity_factor < 200:
-        complexity = "ÉLEVÉE"
-        est_time = "15-30 minutes"
-    else:
-        complexity = "TRÈS ÉLEVÉE"
-        est_time = "30+ minutes"
-    
-    print(f"✓ Complexité estimée: {complexity}")
-    print(f"✓ Temps estimé: {est_time}")
-    
-    # Demander paramètres
-    print(f"\n⚙️  Paramètres d'exécution:")
     
     # Paramètres adaptatifs
     if total_ops <= 1000:
         default_pop, default_gens = 60, 100
+        mode = "FAIBLE"
     elif total_ops <= 5000:
         default_pop, default_gens = 50, 80
+        mode = "MOYEN"
     elif total_ops <= 20000:
         default_pop, default_gens = 40, 60
+        mode = "ÉLEVÉ"
     else:
-        default_pop, default_gens = 30, 40
+        default_pop, default_gens = 25, 30
+        mode = "TRÈS ÉLEVÉ"
     
-    print(f"   Valeurs par défaut: Population={default_pop}, Générations={default_gens}")
+    print(f"\n⚙️  Mode: {mode}")
+    print(f"   Population par défaut: {default_pop}")
+    print(f"   Générations par défaut: {default_gens}")
     
-    use_default = input(f"   Utiliser les valeurs par défaut? (o/n): ").strip().lower()
+    # Utiliser les valeurs par défaut pour commencer
+    population = default_pop
+    generations = default_gens
     
-    if use_default in ['o', 'oui', 'y', 'yes']:
-        population = default_pop
-        generations = default_gens
-    else:
-        try:
-            population = int(input(f"   Population (5-100, défaut {default_pop}): ") or default_pop)
-            generations = int(input(f"   Générations (10-200, défaut {default_gens}): ") or default_gens)
-            population = max(5, min(100, population))
-            generations = max(10, min(200, generations))
-        except:
-            print("⚠️  Valeurs invalides, utilisation des valeurs par défaut")
-            population = default_pop
-            generations = default_gens
-    
-    print(f"\n✅ Configuration finale:")
+    print(f"\n✅ Configuration:")
     print(f"   Fichier: {selected_file}")
     print(f"   Population: {population}")
     print(f"   Générations: {generations}")
@@ -199,10 +112,10 @@ def run_advanced_analysis(selected_file):
     
     # Confirmation pour datasets très grands
     if total_ops > 10000:
-        print(f"\n⚠️  ATTENTION: Dataset très grand!")
+        print(f"\n⚠️  ATTENTION: Dataset très grand ({total_ops} opérations)!")
         print(f"   Cette exécution peut prendre du temps.")
-        confirm = input("   Continuer? (oui/NON): ").strip().lower()
-        if confirm != 'oui':
+        confirm = input("   Continuer? (o/n): ").strip().lower()
+        if confirm not in ['o', 'oui', 'y', 'yes']:
             print("❌ Annulé")
             return
     
@@ -243,17 +156,14 @@ def run_advanced_analysis(selected_file):
         save_stats_fast(best_solution, tasks, f'{base_name}_advanced_stats.txt')
         
         # Visualisations adaptatives
+        print(f"\n🎨 Génération des visualisations...")
+        plot_convergence_fast(best_history, avg_history, f'{base_name}_advanced_convergence.png')
+        
         if total_ops <= 5000:
-            print(f"\n🎨 Génération des visualisations...")
-            plot_convergence_fast(best_history, avg_history, f'{base_name}_advanced_convergence.png')
-            
-            if total_ops <= 2000:
-                plot_gantt_simplified(best_solution, tasks, job_ids, f'{base_name}_advanced_gantt.png', max_jobs=50)
-            else:
-                plot_gantt_simplified(best_solution, tasks, job_ids, f'{base_name}_advanced_gantt.png', max_jobs=30)
+            plot_gantt_simplified(best_solution, tasks, job_ids, 
+                                 f'{base_name}_advanced_gantt.png', 
+                                 max_jobs=30 if total_ops > 2000 else 50)
         else:
-            print(f"\n🎨 Génération du graphique de convergence...")
-            plot_convergence_fast(best_history, avg_history, f'{base_name}_advanced_convergence.png')
             print("⚠️  Gantt simplifié ignoré (dataset trop grand)")
         
         # Résumé
