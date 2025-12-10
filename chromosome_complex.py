@@ -1,4 +1,8 @@
-# chromosome_complex.py - VERSION COMPLÈTE CORRIGÉE
+"""
+Job Shop Scheduling - Algorithme Génétique OPTIMISÉ
+Version simplifiée pour grands datasets
+"""
+
 import json
 import random
 import matplotlib.pyplot as plt
@@ -7,649 +11,541 @@ from copy import deepcopy
 import numpy as np
 import os
 import time
+import sys
+import gc
 from collections import defaultdict
-import multiprocessing as mp
 
 # ==================== CONFIGURATION ====================
 DATA_DIR = "data"
 RESULTS_DIR = "Results"
 
-# Créer les dossiers
 for directory in [DATA_DIR, RESULTS_DIR]:
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-# ==================== CHARGEMENT OPTIMISÉ ====================
-def load_tasks_fast(filename='tasks.json'):
-    """Chargement rapide avec vérification"""
+# ==================== CHARGEMENT DES DONNÉES ====================
+def load_tasks(filename='tasks_large.json'):
+    """Charge les tâches depuis le fichier JSON"""
     filepath = os.path.join(DATA_DIR, filename)
-    
     try:
         with open(filepath, 'r') as f:
             data = json.load(f)
-        print(f"✓ Chargé: {filepath} ({len(data)} jobs)")
+        print(f"✓ Fichier chargé: {filepath} ({len(data)} jobs)")
         return data
-    except Exception as e:
-        print(f"❌ Erreur: {filepath} - {str(e)}")
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"❌ Erreur: {e}")
         return []
 
-def create_optimized_mapping(tasks):
-    """Mapping ultra-optimisé"""
+def create_task_mapping(tasks):
+    """Crée un mapping entre job_id et task"""
     task_by_id = {}
-    job_ids = []
-    job_op_counts = {}
-    
-    for idx, task in enumerate(tasks):
-        job_id = task['id']
-        task_by_id[job_id] = {
-            'idx': idx,
-            'operations': task['operations'],
-            'op_count': len(task['operations'])
-        }
-        job_ids.append(job_id)
-        job_op_counts[job_id] = len(task['operations'])
-    
-    return task_by_id, job_ids, job_op_counts
+    for task in tasks:
+        task_by_id[task['id']] = task
+    return task_by_id
 
-# ==================== CHROMOSOME OPTIMISÉ ====================
-class ChromosomeFast:
-    """Chromosome optimisé pour grands datasets"""
+# ==================== REPRÉSENTATION ====================
+class OperationGene:
+    """Représente une opération"""
+    __slots__ = ('job_id', 'op_index', 'machine_id', 'duration')
     
+    def __init__(self, job_id, op_index, machine_id, duration):
+        self.job_id = job_id
+        self.op_index = op_index
+        self.machine_id = machine_id
+        self.duration = duration
+    
+    def __repr__(self):
+        return f"({self.job_id}.{self.op_index}@{self.machine_id}:{self.duration})"
+    
+    def __eq__(self, other):
+        if not isinstance(other, OperationGene):
+            return False
+        return (self.job_id == other.job_id and 
+                self.op_index == other.op_index)
+    
+    def __hash__(self):
+        return hash((self.job_id, self.op_index))
+
+class Chromosome:
+    """Représente une solution"""
     def __init__(self, genes=None, num_jobs=0):
-        self.genes = genes if genes is not None else []
-        self.fitness = 0.0
+        self.genes = genes if genes else []
+        self.fitness = 0
         self.makespan = float('inf')
         self.num_jobs = num_jobs
     
     def __repr__(self):
-        return f"Chromosome(makespan={self.makespan:.1f}, fitness={self.fitness:.6f})"
-    
-    def is_valid(self, job_op_counts):
-        """Vérifie si le chromosome est valide"""
-        from collections import Counter
-        actual_counts = Counter(self.genes)
-        
-        for job_id, expected in job_op_counts.items():
-            if actual_counts.get(job_id, 0) != expected:
-                return False
-        
-        return True
-    
-    def repair(self, job_op_counts):
-        """Répare un chromosome invalide"""
-        from collections import Counter
-        actual_counts = Counter(self.genes)
-        
-        # Liste des gènes manquants
-        missing_genes = []
-        extra_genes = []
-        
-        for job_id, expected in job_op_counts.items():
-            actual = actual_counts.get(job_id, 0)
-            if actual < expected:
-                missing_genes.extend([job_id] * (expected - actual))
-            elif actual > expected:
-                extra_genes.extend([job_id] * (actual - expected))
-        
-        # Si correct, retourner tel quel
-        if not missing_genes and not extra_genes:
-            return self
-        
-        # Créer une copie des gènes
-        repaired_genes = self.genes.copy()
-        
-        # Retirer les extras (en partant de la fin)
-        if extra_genes:
-            # Compter combien de chaque à retirer
-            to_remove = Counter(extra_genes)
-            
-            # Retirer en parcourant à l'envers
-            for i in range(len(repaired_genes)-1, -1, -1):
-                gene = repaired_genes[i]
-                if to_remove.get(gene, 0) > 0:
-                    repaired_genes.pop(i)
-                    to_remove[gene] -= 1
-                    if sum(to_remove.values()) == 0:
-                        break
-        
-        # Ajouter les manquants
-        if missing_genes:
-            random.shuffle(missing_genes)
-            repaired_genes.extend(missing_genes)
-        
-        # S'assurer de la bonne longueur
-        expected_len = sum(job_op_counts.values())
-        if len(repaired_genes) > expected_len:
-            repaired_genes = repaired_genes[:expected_len]
-        elif len(repaired_genes) < expected_len:
-            # Ajouter des gènes aléatoires manquants
-            while len(repaired_genes) < expected_len:
-                random_job = random.choice(list(job_op_counts.keys()))
-                repaired_genes.append(random_job)
-        
-        return ChromosomeFast(repaired_genes, self.num_jobs)
+        return f"Chromosome(makespan={self.makespan:.0f})"
 
-# ==================== DÉCODAGE ULTRA-RAPIDE ====================
-def decode_chromosome_fast(chromosome, tasks, task_by_id=None):
-    """Décodage 10x plus rapide avec pré-calcul"""
-    if task_by_id is None:
-        task_by_id, _, _ = create_optimized_mapping(tasks)
+# ==================== DÉCODAGE CORRECT ====================
+def decode_chromosome(chromosome, tasks, task_by_id):
+    """
+    Décodage CORRECT qui reproduit le comportement du décodeur original
+    Ce décodeur parcourt le chromosome séquentiellement et planifie les opérations
+    dans l'ordre où elles apparaissent, en respectant les contraintes de précédence
+    """
+    # Initialisation des structures
+    machine_end_times = defaultdict(int)  # temps de fin sur chaque machine
+    job_end_times = defaultdict(int)      # temps de fin du dernier opération de chaque job
+    job_next_op = defaultdict(int)        # prochaine opération à planifier pour chaque job
     
-    # Utiliser des arrays numpy pour la performance
-    job_op_counter = defaultdict(int)
-    machine_times = {}
-    job_times = defaultdict(float)
+    schedule = []
+    scheduled_ops = set()
+    total_ops = sum(len(task['operations']) for task in tasks)
     
-    max_time = 0.0
-    
-    for gene in chromosome.genes:
-        job_data = task_by_id.get(gene)
-        if not job_data:
-            continue
+    # Parcourir le chromosome plusieurs fois jusqu'à ce que toutes les opérations soient planifiées
+    # Ceci reproduit la logique de la boucle while du décodeur original
+    while len(scheduled_ops) < total_ops:
+        for gene in chromosome.genes:
+            if len(scheduled_ops) >= total_ops:
+                break
+                
+            job_id = gene.job_id
+            op_idx = gene.op_index
+            op_key = (job_id, op_idx)
             
-        op_idx = job_op_counter[gene]
-        # Vérifier l'index
-        if op_idx >= job_data['op_count']:
-            # Si trop d'opérations pour ce job, ignorer
-            continue
+            # Skip si déjà planifié
+            if op_key in scheduled_ops:
+                continue
+                
+            # Vérifier si c'est la prochaine opération à planifier pour ce job
+            if op_idx != job_next_op[job_id]:
+                continue
+                
+            # Récupérer les données de l'opération
+            task = task_by_id[job_id]
+            op_data = task['operations'][op_idx]
+            machine_id = op_data['machine_id']
+            duration = op_data['duration']
             
-        operation = job_data['operations'][op_idx]
-        machine = operation['machine_id']
-        duration = operation['duration']
-        
-        machine_time = machine_times.get(machine, 0.0)
-        job_time = job_times[gene]
-        
-        start = max(machine_time, job_time)
-        end = start + duration
-        
-        machine_times[machine] = end
-        job_times[gene] = end
-        job_op_counter[gene] += 1
-        
-        if end > max_time:
-            max_time = end
+            # Temps de début = max(fin précédente opération du job, fin dernière opération sur la machine)
+            job_ready_time = job_end_times[job_id]
+            machine_ready_time = machine_end_times[machine_id]
+            start_time = max(job_ready_time, machine_ready_time)
+            end_time = start_time + duration
+            
+            # Planifier l'opération
+            schedule.append({
+                'job_id': job_id,
+                'op_idx': op_idx,
+                'machine_id': machine_id,
+                'start': start_time,
+                'end': end_time,
+                'duration': duration
+            })
+            
+            # Mettre à jour les états
+            scheduled_ops.add(op_key)
+            job_next_op[job_id] += 1
+            job_end_times[job_id] = end_time
+            machine_end_times[machine_id] = end_time
     
-    return max_time
-
-# ==================== ÉVALUATION ====================
-def evaluate_population_sequential(population, tasks, task_by_id, job_op_counts):
-    """Évaluation séquentielle avec validation"""
-    for chrom in population:
-        # Vérifier et réparer si nécessaire
-        if not chrom.is_valid(job_op_counts):
-            chrom = chrom.repair(job_op_counts)
-        
-        makespan = decode_chromosome_fast(chrom, tasks, task_by_id)
-        chrom.makespan = makespan
-        chrom.fitness = 1.0 / (makespan + 1)  # +1 pour éviter division par 0
+    # Calculer le makespan (temps de fin maximum parmi tous les jobs)
+    makespan = max(job_end_times.values()) if job_end_times else 0
     
-    return population
+    # Vérification
+    if len(scheduled_ops) != total_ops:
+        print(f"⚠️ ATTENTION: {len(scheduled_ops)}/{total_ops} opérations planifiées")
+    
+    return schedule, makespan
 
-# ==================== INITIALISATION RAPIDE ====================
-def create_population_fast(tasks, population_size, job_op_counts):
-    """Création rapide de population diversifiée avec validation"""
+# ==================== INITIALISATION ====================
+def create_initial_population(tasks, population_size=20):
+    """Crée une population initiale"""
+    print(f"Création de la population ({population_size} individus)...")
+    
+    # Créer toutes les opérations
+    all_operations = []
+    for task in tasks:
+        task_id = task['id']
+        for op_idx, op_data in enumerate(task['operations']):
+            all_operations.append(OperationGene(
+                job_id=task_id,
+                op_index=op_idx,
+                machine_id=op_data['machine_id'],
+                duration=op_data['duration']
+            ))
+    
+    total_ops = len(all_operations)
+    print(f"  Total opérations: {total_ops:,}")
+    
+    # Créer la population
     population = []
-    
-    # Créer séquence de base valide
-    base_sequence = []
-    for job_id, count in job_op_counts.items():
-        base_sequence.extend([job_id] * count)
-    
-    # Stratégies variées
-    strategies = ['shuffle', 'sorted', 'reverse', 'partial_shuffle']
-    
     for i in range(population_size):
-        strategy = strategies[i % len(strategies)]
-        genes = base_sequence.copy()
+        genes = all_operations.copy()
+        random.shuffle(genes)
+        chromosome = Chromosome(genes, len(tasks))
+        population.append(chromosome)
         
-        if strategy == 'shuffle':
-            random.shuffle(genes)
-        elif strategy == 'sorted':
-            genes.sort()
-        elif strategy == 'reverse':
-            genes.sort(reverse=True)
-        elif strategy == 'partial_shuffle':
-            # Mélanger seulement une partie
-            shuffle_size = max(10, len(genes) // 20)
-            for _ in range(shuffle_size):
-                a, b = random.sample(range(len(genes)), 2)
-                genes[a], genes[b] = genes[b], genes[a]
-        
-        chrom = ChromosomeFast(genes, len(tasks))
-        
-        # Double vérification
-        if not chrom.is_valid(job_op_counts):
-            chrom = chrom.repair(job_op_counts)
-        
-        population.append(chrom)
+        if (i + 1) % 5 == 0:
+            print(f"  Créé {i + 1}/{population_size} individus...")
     
     return population
 
-# ==================== OPÉRATEURS OPTIMISÉS ====================
-def tournament_selection_fast(population, size=5):
-    """Sélection rapide par tournoi"""
-    if len(population) <= size:
-        return max(population, key=lambda x: x.fitness)
-    
-    tournament = random.sample(population, size)
+# ==================== OPÉRATEURS GÉNÉTIQUES ====================
+def tournament_selection(population, tournament_size=3):
+    """Sélection par tournoi"""
+    if len(population) < tournament_size:
+        return random.choice(population)
+    tournament = random.sample(population, tournament_size)
     return max(tournament, key=lambda x: x.fitness)
 
-def order_crossover_safe(parent1, parent2, job_op_counts):
-    """Croisement OX simple et robuste"""
+def order_crossover(parent1, parent2):
+    """Order Crossover (OX) pour les permutations"""
     size = len(parent1.genes)
-    
-    # Vérifications de base
-    if size != len(parent2.genes) or size < 2:
+    if size < 2:
         return deepcopy(parent1), deepcopy(parent2)
     
-    # Créer une séquence de base valide
-    base_sequence = []
-    for job_id, count in job_op_counts.items():
-        base_sequence.extend([job_id] * count)
+    # Choisir un segment (limité à 100 gènes max pour la performance)
+    segment_size = min(50, size // 20)
+    point1 = random.randint(0, size - segment_size)
+    point2 = point1 + segment_size
     
-    # Mélanger pour diversité
-    child1_genes = base_sequence.copy()
-    child2_genes = base_sequence.copy()
+    child1_genes = [None] * size
+    child2_genes = [None] * size
     
-    # Échanger des segments entre parents si assez grand
-    if size > 20:
-        # Prendre un segment du parent1
-        segment_size = random.randint(5, min(15, size // 4))
-        start1 = random.randint(0, size - segment_size)
-        segment1 = parent1.genes[start1:start1 + segment_size]
-        
-        # Trouver une position d'insertion dans child2
-        insert_pos = random.randint(0, len(child2_genes) - segment_size)
-        child2_genes[insert_pos:insert_pos + segment_size] = segment1
-        
-        # Prendre un segment du parent2
-        start2 = random.randint(0, size - segment_size)
-        segment2 = parent2.genes[start2:start2 + segment_size]
-        
-        # Insérer dans child1
-        insert_pos = random.randint(0, len(child1_genes) - segment_size)
-        child1_genes[insert_pos:insert_pos + segment_size] = segment2
+    # Copier les segments
+    for i in range(point1, point2):
+        child1_genes[i] = parent1.genes[i]
+        child2_genes[i] = parent2.genes[i]
     
-    # Créer chromosomes
-    chrom1 = ChromosomeFast(child1_genes, parent1.num_jobs)
-    chrom2 = ChromosomeFast(child2_genes, parent2.num_jobs)
+    # Remplir le reste
+    def fill_child(child_genes, parent, segment_set):
+        pos = point2
+        for i in range(size):
+            idx = (point2 + i) % size
+            gene = parent.genes[idx]
+            if gene not in segment_set:
+                child_genes[pos % size] = gene
+                pos += 1
     
-    # Valider
-    if not chrom1.is_valid(job_op_counts):
-        chrom1 = chrom1.repair(job_op_counts)
-    if not chrom2.is_valid(job_op_counts):
-        chrom2 = chrom2.repair(job_op_counts)
+    fill_child(child1_genes, parent2, set(parent1.genes[point1:point2]))
+    fill_child(child2_genes, parent1, set(parent2.genes[point1:point2]))
     
-    return chrom1, chrom2
+    return Chromosome(child1_genes, parent1.num_jobs), Chromosome(child2_genes, parent2.num_jobs)
 
-def swap_mutation_safe(chromosome, mutation_rate=0.1, job_op_counts=None):
-    """Mutation avec taux variable"""
-    size = len(chromosome.genes)
-    if size < 2:
+def swap_mutation(chromosome, mutation_rate=0.1):
+    """Mutation par échange"""
+    if random.random() > mutation_rate or len(chromosome.genes) < 2:
         return chromosome
     
-    # Nombre de swaps basé sur la taille
-    num_swaps = max(1, int(size * mutation_rate))
-    
-    for _ in range(num_swaps):
-        a, b = random.sample(range(size), 2)
-        chromosome.genes[a], chromosome.genes[b] = chromosome.genes[b], chromosome.genes[a]
-    
-    # Vérifier après mutation
-    if job_op_counts and not chromosome.is_valid(job_op_counts):
-        chromosome = chromosome.repair(job_op_counts)
-    
+    # Échanger deux positions aléatoires
+    pos1, pos2 = random.sample(range(len(chromosome.genes)), 2)
+    chromosome.genes[pos1], chromosome.genes[pos2] = chromosome.genes[pos2], chromosome.genes[pos1]
     return chromosome
 
-def scramble_mutation_safe(chromosome, job_op_counts=None):
-    """Mutation par brouillage d'un segment"""
-    size = len(chromosome.genes)
-    if size < 3:
-        return chromosome
+# ==================== ALGORITHME GÉNÉTIQUE ====================
+def genetic_algorithm_large(tasks, population_size=20, num_generations=30):
+    """Algorithme génétique optimisé pour grands datasets"""
+    print(f"\n{'='*60}")
+    print(f"ALGORITHME GÉNÉTIQUE POUR GRAND DATASET")
+    print(f"{'='*60}")
     
-    # Choisir un segment
-    start = random.randint(0, size - 3)
-    end = random.randint(start + 2, min(start + 10, size))
-    
-    # Brouiller
-    segment = chromosome.genes[start:end]
-    random.shuffle(segment)
-    chromosome.genes[start:end] = segment
-    
-    # Vérifier après mutation
-    if job_op_counts and not chromosome.is_valid(job_op_counts):
-        chromosome = chromosome.repair(job_op_counts)
-    
-    return chromosome
-
-# ==================== ALGORITHME GÉNÉTIQUE AVANCÉ ====================
-def genetic_algorithm_advanced(tasks, population_size=100, num_generations=200, 
-                              crossover_rate=0.85, mutation_rate=0.15, 
-                              elitism_count=5, adaptive_params=True):
-    """
-    Algorithme génétique avancé pour grands datasets
-    """
-    
-    print(f"\n{'='*70}")
-    print("ALGORITHME GÉNÉTIQUE AVANCÉ - GRANDS DATASETS")
-    print(f"{'='*70}")
-    print(f"Jobs: {len(tasks)}")
+    # Statistiques
+    total_ops = sum(len(task['operations']) for task in tasks)
+    print(f"Jobs: {len(tasks):,}")
+    print(f"Opérations totales: {total_ops:,}")
     print(f"Population: {population_size}")
     print(f"Générations: {num_generations}")
     
-    # Pré-calculer
-    task_by_id, job_ids, job_op_counts = create_optimized_mapping(tasks)
-    total_ops = sum(job_op_counts.values())
-    print(f"Opérations totales: {total_ops}")
+    # Préparer les données
+    task_by_id = create_task_mapping(tasks)
     
-    # Ajustement automatique des paramètres
-    if adaptive_params:
-        if total_ops > 10000:
-            population_size = min(population_size, 60)
-            num_generations = min(num_generations, 100)
-            print(f"⚙️  Paramètres ajustés: pop={population_size}, gens={num_generations}")
+    # Créer la population initiale
+    population = create_initial_population(tasks, population_size)
     
-    # Créer population
-    print("\nCréation de la population...")
-    population = create_population_fast(tasks, population_size, job_op_counts)
+    # Évaluation initiale
+    print("\nÉvaluation initiale...")
+    for i, individual in enumerate(population):
+        _, makespan = decode_chromosome(individual, tasks, task_by_id)
+        individual.makespan = makespan
+        individual.fitness = 1.0 / makespan if makespan > 0 else 0
+        
+        if (i + 1) % 5 == 0:
+            print(f"  Évalué {i + 1}/{len(population)} individus...")
     
-    # Évaluer
-    print("Évaluation initiale...")
-    start_eval = time.time()
-    population = evaluate_population_sequential(population, tasks, task_by_id, job_op_counts)
-    print(f"✓ Évaluation: {time.time() - start_eval:.1f}s")
-    
-    # Statistiques
-    best_history = []
-    avg_history = []
+    # Exécution principale
+    print("\nDémarrage de l'évolution...")
+    start_time = time.time()
     best_solution = None
-    stagnation_counter = 0
-    
-    # Boucle principale
-    print("\nDémarrage des générations...")
-    overall_start = time.time()
     
     for generation in range(num_generations):
-        gen_start = time.time()
-        
-        # Trier
+        # Trier par fitness
         population.sort(key=lambda x: x.fitness, reverse=True)
-        
-        # Sauvegarder le meilleur
         current_best = population[0]
+        
+        # Sauvegarder la meilleure solution
         if best_solution is None or current_best.fitness > best_solution.fitness:
             best_solution = deepcopy(current_best)
-            stagnation_counter = 0
-        else:
-            stagnation_counter += 1
         
-        # Statistiques
-        best_fitness = current_best.fitness
-        avg_fitness = sum(c.fitness for c in population) / len(population)
-        best_history.append(best_fitness)
-        avg_history.append(avg_fitness)
-        
-        # Affichage
+        # Afficher la progression
         if generation % 5 == 0 or generation == num_generations - 1:
-            elapsed = time.time() - overall_start
-            print(f"Gen {generation:4d}: Makespan = {current_best.makespan:10.1f}, "
-                  f"Fitness = {best_fitness:.6f}, Time = {elapsed:.1f}s")
+            elapsed = time.time() - start_time
+            progress = (generation + 1) / num_generations * 100
+            print(f"Gen {generation:3d}: Makespan = {current_best.makespan:8.0f}, "
+                  f"Progress = {progress:5.1f}%, Time = {elapsed:.0f}s")
         
-        # Mutation adaptative
-        current_mutation_rate = mutation_rate
-        if stagnation_counter > 20:
-            current_mutation_rate = min(0.3, mutation_rate * 1.5)  # Augmenter mutation
-        elif generation < num_generations // 4:
-            current_mutation_rate = mutation_rate * 1.2  # Plus de mutation en début
+        # Nouvelle génération (élitisme)
+        elite_count = max(2, int(population_size * 0.1))
+        new_population = deepcopy(population[:elite_count])
         
-        # Élitisme
-        new_population = [deepcopy(population[i]) for i in range(elitism_count)]
-        
-        # Génération
+        # Reproduction
         while len(new_population) < population_size:
-            # Sélection
-            parent1 = tournament_selection_fast(population)
-            parent2 = tournament_selection_fast(population)
+            parent1 = tournament_selection(population)
+            parent2 = tournament_selection(population)
             
-            # Croisement
-            if random.random() < crossover_rate:
-                child1, child2 = order_crossover_safe(parent1, parent2, job_op_counts)
+            # Crossover (80% de chance)
+            if random.random() < 0.8:
+                child1, child2 = order_crossover(parent1, parent2)
             else:
-                child1 = deepcopy(parent1)
-                child2 = deepcopy(parent2)
+                child1, child2 = deepcopy(parent1), deepcopy(parent2)
             
             # Mutation
-            if random.random() < current_mutation_rate:
-                if random.random() < 0.7:
-                    child1 = swap_mutation_safe(child1, 0.05, job_op_counts)
-                else:
-                    child1 = scramble_mutation_safe(child1, job_op_counts)
+            child1 = swap_mutation(child1, mutation_rate=0.1)
+            child2 = swap_mutation(child2, mutation_rate=0.1)
             
-            if random.random() < current_mutation_rate:
-                if random.random() < 0.7:
-                    child2 = swap_mutation_safe(child2, 0.05, job_op_counts)
-                else:
-                    child2 = scramble_mutation_safe(child2, job_op_counts)
-            
-            # Valider avant d'ajouter
-            if not child1.is_valid(job_op_counts):
-                child1 = child1.repair(job_op_counts)
-            if not child2.is_valid(job_op_counts):
-                child2 = child2.repair(job_op_counts)
-            
-            new_population.extend([child1, child2])
+            # Ajouter à la nouvelle population
+            new_population.append(child1)
+            if len(new_population) < population_size:
+                new_population.append(child2)
         
-        # Limiter taille
+        # Réévaluation des nouveaux individus seulement
         population = new_population[:population_size]
+        for i in range(elite_count, len(population)):
+            _, makespan = decode_chromosome(population[i], tasks, task_by_id)
+            population[i].makespan = makespan
+            population[i].fitness = 1.0 / makespan if makespan > 0 else 0
         
-        # Évaluer
-        if generation % 3 == 0 or generation == num_generations - 1:
-            population = evaluate_population_sequential(population, tasks, task_by_id, job_op_counts)
-        
-        # Redémarrage partiel si stagnation
-        if stagnation_counter > 30:
-            print(f"  🔄 Redémarrage partiel à la génération {generation}")
-            # Garder 20% des meilleurs, regénérer le reste
-            keep_count = max(5, population_size // 5)
-            new_diverse = create_population_fast(tasks, population_size - keep_count, job_op_counts)
-            population = population[:keep_count] + new_diverse
-            population = evaluate_population_sequential(population, tasks, task_by_id, job_op_counts)
-            stagnation_counter = 0
-        
-        gen_time = time.time() - gen_start
-        if gen_time > 10:  # Génération trop lente
-            print(f"  ⚠️  Génération lente: {gen_time:.1f}s")
+        # Nettoyage mémoire périodique
+        if generation % 10 == 0:
+            gc.collect()
     
-    # Résultats finaux
-    total_time = time.time() - overall_start
-    population.sort(key=lambda x: x.fitness, reverse=True)
-    if population[0].fitness > best_solution.fitness:
-        best_solution = deepcopy(population[0])
+    total_time = time.time() - start_time
     
-    print(f"\n{'='*70}")
-    print("RÉSULTATS FINAUX")
-    print(f"{'='*70}")
-    print(f"Meilleur makespan: {best_solution.makespan:.1f}")
-    print(f"Fitness: {best_solution.fitness:.6f}")
+    print(f"\n{'='*60}")
+    print(f"RÉSULTATS FINAUX")
+    print(f"{'='*60}")
     print(f"Temps total: {total_time:.1f} secondes")
-    print(f"Générations: {num_generations}")
-    print(f"{'='*70}")
+    print(f"Meilleur makespan: {best_solution.makespan:,.0f}")
+    print(f"Fitness: {best_solution.fitness:.6f}")
+    print(f"{'='*60}")
     
-    return best_solution, best_history, avg_history, job_ids
+    return best_solution
 
-# ==================== VISUALISATIONS ====================
-def plot_convergence_fast(best_history, avg_history, filename='convergence_fast.png'):
-    """Graphique de convergence simplifié"""
-    filepath = os.path.join(RESULTS_DIR, filename)
+# ==================== VALIDATION ====================
+def validate_solution(chromosome, tasks):
+    """Validation simplifiée"""
+    print("\n=== VALIDATION DE LA SOLUTION ===")
     
-    plt.figure(figsize=(10, 6))
-    gens = range(len(best_history))
+    task_by_id = create_task_mapping(tasks)
+    schedule, makespan = decode_chromosome(chromosome, tasks, task_by_id)
     
-    plt.plot(gens, best_history, 'b-', label='Meilleur', linewidth=2)
-    plt.plot(gens, avg_history, 'r--', label='Moyenne', linewidth=1.5, alpha=0.7)
+    # 1. Vérifier le nombre d'opérations
+    expected_ops = sum(len(task['operations']) for task in tasks)
+    actual_ops = len(schedule)
     
-    plt.xlabel('Génération')
-    plt.ylabel('Fitness (1/makespan)')
-    plt.title('Convergence - Algorithm Génétique Avancé')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    print(f"1. Opérations attendues: {expected_ops:,}")
+    print(f"   Opérations planifiées: {actual_ops:,}")
     
-    plt.tight_layout()
-    plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    print(f"✓ Convergence sauvegardée: {filepath}")
-    plt.show()
-
-def plot_gantt_simplified(chromosome, tasks, job_ids, filename='gantt_simple.png', max_jobs=50):
-    """Diagramme de Gantt simplifié pour grands datasets"""
-    filepath = os.path.join(RESULTS_DIR, filename)
+    if expected_ops != actual_ops:
+        print(f"   ❌ ERREUR: {expected_ops - actual_ops} opérations manquantes!")
+        return False
     
-    # Décoder
-    task_by_id, _, job_op_counts = create_optimized_mapping(tasks)
+    # 2. Vérifier les précédences sur un échantillon
+    print(f"2. Vérification des précédences...")
     
-    # Décoder pour visualisation (seulement les premiers jobs)
-    job_op_counter = defaultdict(int)
-    machine_times = {}
-    job_times = defaultdict(float)
-    operations = []
+    # Prendre un échantillon de jobs (max 100)
+    sample_size = min(100, len(tasks))
+    sample_jobs = random.sample(tasks, sample_size)
+    sample_job_ids = {job['id'] for job in sample_jobs}
     
-    job_ids_to_show = job_ids[:max_jobs]
+    # Regrouper les opérations par job
+    job_ops = defaultdict(list)
+    for op in schedule:
+        if op['job_id'] in sample_job_ids:
+            job_ops[op['job_id']].append(op)
     
-    for gene in chromosome.genes:
-        if gene not in job_ids_to_show:
-            continue
-            
-        job_data = task_by_id[gene]
-        op_idx = job_op_counter[gene]
-        
-        if op_idx >= job_data['op_count']:
-            continue
-            
-        operation = job_data['operations'][op_idx]
-        machine = operation['machine_id']
-        duration = operation['duration']
-        
-        machine_time = machine_times.get(machine, 0.0)
-        job_time = job_times[gene]
-        
-        start = max(machine_time, job_time)
-        end = start + duration
-        
-        operations.append({
-            'job_id': gene,
-            'machine': machine,
-            'start': start,
-            'end': end,
-            'duration': duration
-        })
-        
-        machine_times[machine] = end
-        job_times[gene] = end
-        job_op_counter[gene] += 1
+    # Vérifier les précédences
+    precedence_ok = True
+    for job_id, ops in job_ops.items():
+        ops.sort(key=lambda x: x['op_idx'])
+        for i in range(1, len(ops)):
+            if ops[i]['start'] < ops[i-1]['end']:
+                print(f"   ❌ ERREUR précédence Job {job_id}")
+                precedence_ok = False
+                break
     
-    # Calculer le makespan pour l'affichage
-    makespan = max((op['end'] for op in operations), default=0)
+    if precedence_ok:
+        print(f"   ✓ Toutes les précédences sont respectées (sur {sample_size} jobs)")
     
-    # Créer figure
-    fig, ax = plt.subplots(figsize=(16, 8))
-    
-    # Organiser machines
-    machines = sorted(set(op['machine'] for op in operations))
-    machine_to_y = {m: i for i, m in enumerate(machines)}
-    
-    # Couleurs
-    colors = plt.cm.tab20(np.linspace(0, 1, min(20, len(job_ids_to_show))))
-    job_to_color = {job: colors[i % len(colors)] for i, job in enumerate(job_ids_to_show)}
-    
-    # Dessiner
-    for op in operations:
-        y = machine_to_y[op['machine']]
-        color = job_to_color[op['job_id']]
-        
-        rect = plt.Rectangle(
-            (op['start'], y - 0.4),
-            op['duration'],
-            0.8,
-            facecolor=color,
-            edgecolor='black',
-            alpha=0.7
-        )
-        ax.add_patch(rect)
-        
-        # Texte seulement si assez large
-        if op['duration'] > makespan * 0.01:
-            label = str(op['job_id']).replace('job_', 'J')
-            ax.text(op['start'] + op['duration']/2, y, label,
-                   ha='center', va='center', fontsize=6)
-    
-    # Configuration
-    ax.set_xlim(0, makespan * 1.05 if makespan > 0 else 1)
-    ax.set_ylim(-0.5, len(machines) - 0.5)
-    ax.set_xlabel('Temps')
-    ax.set_ylabel('Machines')
-    ax.set_title(f'Gantt Simplifié (premiers {max_jobs} jobs) - Makespan: {makespan:.1f}')
-    ax.set_yticks(range(len(machines)))
-    ax.set_yticklabels(machines, fontsize=9)
-    ax.grid(True, alpha=0.2, axis='x')
-    
-    plt.tight_layout()
-    plt.savefig(filepath, dpi=150, bbox_inches='tight')
-    print(f"✓ Gantt simplifié sauvegardé: {filepath}")
-    plt.show()
-
-def save_stats_fast(chromosome, tasks, filename='stats_fast.txt'):
-    """Statistiques rapides"""
-    filepath = os.path.join(RESULTS_DIR, filename)
-    
-    task_by_id, _, job_op_counts = create_optimized_mapping(tasks)
-    makespan = decode_chromosome_fast(chromosome, tasks, task_by_id)
+    # 3. Statistiques de base
+    print(f"\n3. Statistiques de la solution:")
+    print(f"   • Makespan: {makespan:,.0f}")
     
     # Calculer l'utilisation des machines
-    job_op_counter = defaultdict(int)
-    machine_times = {}
-    job_times = defaultdict(float)
-    machine_usage = defaultdict(float)
+    machine_work = defaultdict(int)
+    for op in schedule:
+        machine_work[op['machine_id']] += op['duration']
     
-    for gene in chromosome.genes:
-        job_data = task_by_id[gene]
-        op_idx = job_op_counter[gene]
+    total_work = sum(machine_work.values())
+    avg_utilization = total_work / (makespan * len(machine_work)) * 100 if makespan > 0 else 0
+    
+    print(f"   • Travail total: {total_work:,.0f}")
+    print(f"   • Machines utilisées: {len(machine_work)}")
+    print(f"   • Utilisation moyenne: {avg_utilization:.1f}%")
+    
+    return precedence_ok
+
+# ==================== VISUALISATION ====================
+def plot_gantt_sample(chromosome, tasks, sample_size=50, filename='gantt_sample.png'):
+    """Génère un diagramme de Gantt pour un échantillon"""
+    try:
+        # Prendre un échantillon
+        if len(tasks) > sample_size:
+            sample_tasks = random.sample(tasks, sample_size)
+        else:
+            sample_tasks = tasks
         
-        if op_idx >= job_data['op_count']:
-            continue
+        # Créer un chromosome pour l'échantillon
+        task_by_id = {t['id']: t for t in sample_tasks}
+        sample_genes = []
+        
+        for gene in chromosome.genes:
+            if gene.job_id in task_by_id:
+                sample_genes.append(gene)
+        
+        sample_chromosome = Chromosome(sample_genes, len(sample_tasks))
+        
+        # Décoder l'échantillon
+        schedule, makespan = decode_chromosome(sample_chromosome, sample_tasks, task_by_id)
+        
+        # Créer le diagramme
+        fig, ax = plt.subplots(figsize=(16, 8))
+        
+        # Couleurs
+        colors = plt.cm.tab20(np.linspace(0, 1, len(sample_tasks)))
+        job_to_index = {task['id']: i for i, task in enumerate(sample_tasks)}
+        
+        # Machines
+        machines = sorted(set(op['machine_id'] for op in schedule))
+        machine_to_y = {machine: i for i, machine in enumerate(machines)}
+        
+        # Dessiner les opérations
+        for operation in schedule:
+            job_id = operation['job_id']
+            job_index = job_to_index[job_id]
+            machine_id = operation['machine_id']
+            start = operation['start']
+            duration = operation['duration']
             
-        operation = job_data['operations'][op_idx]
-        machine = operation['machine_id']
-        duration = operation['duration']
+            y_pos = machine_to_y[machine_id]
+            
+            rect = mpatches.Rectangle(
+                (start, y_pos - 0.4), 
+                duration, 
+                0.8,
+                facecolor=colors[job_index % len(colors)],
+                edgecolor='black',
+                linewidth=0.5,
+                alpha=0.8
+            )
+            ax.add_patch(rect)
+            
+            # Texte si assez grand
+            if duration > makespan * 0.03:
+                label = str(job_id).replace('job_', 'J')
+                ax.text(start + duration/2, y_pos, label,
+                        ha='center', va='center', fontsize=8)
         
-        machine_time = machine_times.get(machine, 0.0)
-        job_time = job_times[gene]
+        # Configuration du graphique
+        ax.set_xlim(0, makespan * 1.01)
+        ax.set_ylim(-0.5, len(machines) - 0.5)
+        ax.set_xlabel('Temps', fontsize=12)
+        ax.set_ylabel('Machines', fontsize=12)
+        ax.set_title(f'Diagramme de Gantt (Échantillon de {len(sample_tasks)} jobs) - Makespan: {makespan:.0f}', 
+                     fontsize=14, pad=20)
         
-        start = max(machine_time, job_time)
-        end = start + duration
+        ax.set_yticks(range(len(machines)))
+        ax.set_yticklabels([f'M{m}' for m in machines], fontsize=9)
+        ax.grid(axis='x', alpha=0.3, linestyle='--')
         
-        machine_times[machine] = end
-        job_times[gene] = end
-        machine_usage[machine] += duration
-        job_op_counter[gene] += 1
+        # Sauvegarder
+        plt.tight_layout()
+        plt.savefig(os.path.join(RESULTS_DIR, filename), dpi=200, bbox_inches='tight')
+        plt.show()
+        print(f"✓ Diagramme d'échantillon sauvegardé: {RESULTS_DIR}/{filename}")
+        
+    except Exception as e:
+        print(f"⚠️  Erreur lors de la création du diagramme: {e}")
+
+# ==================== FONCTION PRINCIPALE ====================
+def main():
+    """Fonction principale"""
+    print("="*60)
+    print("JOB SHOP SCHEDULING - GRAND DATASET")
+    print("="*60)
     
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write("="*60 + "\n")
-        f.write("STATISTIQUES RAPIDES - GRAND DATASET\n")
-        f.write("="*60 + "\n\n")
-        
-        f.write(f"MAKESPAN: {makespan:.1f}\n")
-        f.write(f"FITNESS: {chromosome.fitness:.6f}\n")
-        f.write(f"JOBS: {chromosome.num_jobs}\n")
-        f.write(f"OPÉRATIONS: {sum(job_op_counts.values())}\n\n")
-        
-        f.write("-"*60 + "\n")
-        f.write("UTILISATION DES MACHINES (TOP 10)\n")
-        f.write("-"*60 + "\n")
-        sorted_machines = sorted(machine_usage.items(), key=lambda x: x[1], reverse=True)
-        for machine, usage in sorted_machines[:10]:
-            utilization = (usage / makespan) * 100
-            f.write(f"{machine}: {utilization:.1f}%\n")
-        
-        f.write(f"\nTotal machines: {len(machine_usage)}\n")
+    # Charger les données
+    filename = 'tasks_large.json'
+    tasks = load_tasks(filename)
     
-    print(f"✓ Statistiques sauvegardées: {filepath}")
+    if not tasks:
+        print("❌ Aucune tâche chargée. Vérifiez le fichier tasks_large.json")
+        return
+    
+    # Afficher des statistiques
+    print(f"\n📊 Statistiques du dataset:")
+    print(f"  • Nombre de jobs: {len(tasks):,}")
+    
+    total_ops = sum(len(task['operations']) for task in tasks)
+    avg_ops = total_ops / len(tasks)
+    print(f"  • Total opérations: {total_ops:,}")
+    print(f"  • Moyenne opérations/job: {avg_ops:.1f}")
+    
+    # Paramètres (ajustés pour le grand dataset)
+    print(f"\n⚙️  Paramètres d'exécution:")
+    print("  1. Test rapide (population=10, générations=10)")
+    print("  2. Moyen (population=20, générations=30)")
+    print("  3. Complet (population=30, générations=50)")
+    
+    choice = input("Choisissez une option (1-3, défaut=2): ").strip()
+    
+    if choice == '1':
+        pop_size, num_gens = 10, 10
+    elif choice == '3':
+        pop_size, num_gens = 30, 50
+    else:
+        pop_size, num_gens = 20, 30
+    
+    # Exécuter l'algorithme
+    print(f"\n🚀 Démarrage de l'algorithme génétique...")
+    best_solution = genetic_algorithm_large(
+        tasks,
+        population_size=pop_size,
+        num_generations=num_gens
+    )
+    
+    # Validation
+    print(f"\n🔍 Validation de la solution...")
+    is_valid = validate_solution(best_solution, tasks)
+    
+    if is_valid:
+        print(f"\n✅ SOLUTION VALIDE")
+        print(f"   Makespan obtenu: {best_solution.makespan:,.0f}")
+        
+        # Générer un diagramme d'échantillon
+        print(f"\n🎨 Génération d'un diagramme d'échantillon...")
+        sample_size = min(50, len(tasks))
+        plot_gantt_sample(best_solution, tasks, sample_size=sample_size)
+        
+        # Conseils pour amélioration
+        print(f"\n💡 Conseils pour améliorer les résultats:")
+        print(f"   • Augmenter la population (ex: 50)")
+        print(f"   • Augmenter les générations (ex: 100)")
+        print(f"   • Ajouter une recherche locale")
+        print(f"   • Utiliser un crossover plus sophistiqué")
+    else:
+        print(f"\n❌ SOLUTION INVALIDE")
+
+if __name__ == "__main__":
+    main()
