@@ -1,669 +1,507 @@
-"""
-Job Shop Scheduling - Algorithme Génétique CORRIGÉ
-Version avec représentation correcte des opérations
-"""
-
 import json
+import math
 import random
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from copy import deepcopy
-import numpy as np
-import os
+import argparse
 import time
+from pathlib import Path
+from collections import deque, defaultdict
+from typing import List, Dict, Tuple, Set
+import tracemalloc
+from multiprocessing import Pool, cpu_count
+import numpy as np
 
-# ==================== CONFIGURATION ====================
-DATA_DIR = "data"
-RESULTS_DIR = "Results"
+tracemalloc.start()
 
-for directory in [DATA_DIR, RESULTS_DIR]:
-    if not os.path.exists(directory):
-        os.makedirs(directory)
+# -------------------- GLOBAL CACHE --------------------
+PREDS_CACHE = {}
+GRAPH_CACHE = {}
+TASKS_DICT_GLOBAL = None
+MACHINE_IDS_GLOBAL = None
 
-# ==================== CHARGEMENT DES DONNÉES ====================
-def load_tasks(filename='tasks_small.json'):
-    """Charge les tâches depuis le fichier JSON"""
-    filepath = os.path.join(DATA_DIR, filename)
-    try:
-        with open(filepath, 'r') as f:
-            data = json.load(f)
-        print(f"✓ Fichier chargé: {filepath} ({len(data)} jobs)")
-        return data
-    except (FileNotFoundError, json.JSONDecodeError) as e:
-        print(f"❌ Erreur: {e}")
-        return []
 
-def create_task_mapping(tasks):
-    """Crée un mapping entre job_id et task"""
-    task_by_id = {}
-    job_ids = []
-    
-    for task in tasks:
-        job_id = task['id']
-        task_by_id[job_id] = task
-        job_ids.append(job_id)
-    
-    return task_by_id, job_ids
+# -------------------- IO HELPERS --------------------
+def load_machines(machines_path: Path) -> List[str]:
+    if not machines_path.exists():
+        raise FileNotFoundError(f"machines.json not found at: {machines_path}")
+    with machines_path.open("r", encoding="utf-8") as f:
+        machines = json.load(f)
+    machine_ids: List[str] = []
+    if isinstance(machines, list):
+        for m in machines:
+            if isinstance(m, dict) and "id" in m:
+                machine_ids.append(m["id"])
+            elif isinstance(m, (int, str)):
+                machine_ids.append(str(m))
+    if not machine_ids:
+        raise ValueError("No machine IDs found in machines.json.")
+    return machine_ids
 
-# ==================== REPRÉSENTATION CORRECTE ====================
-class OperationGene:
-    """Représente une opération spécifique avec toutes ses propriétés"""
-    def __init__(self, job_id, op_index, machine_id, duration):
-        self.job_id = job_id
-        self.op_index = op_index
-        self.machine_id = machine_id
-        self.duration = duration
-    
-    def __repr__(self):
-        return f"({self.job_id}.{self.op_index}@{self.machine_id}:{self.duration})"
-    
-    def __eq__(self, other):
-        if not isinstance(other, OperationGene):
-            return False
-        return (self.job_id == other.job_id and 
-                self.op_index == other.op_index)
-    
-    def __hash__(self):
-        return hash((self.job_id, self.op_index))
 
-class Chromosome:
-    """Représente une solution correcte"""
-    def __init__(self, genes=None, num_jobs=0):
-        if genes is None:
-            self.genes = []  # Liste de OperationGene
-        else:
-            self.genes = genes
-        self.fitness = 0
-        self.makespan = float('inf')
-        self.num_jobs = num_jobs
+def load_tasks(tasks_path: Path) -> Dict[int, dict]:
+    if not tasks_path.exists():
+        raise FileNotFoundError(f"tasks file not found at: {tasks_path}")
+    with tasks_path.open("r", encoding="utf-8") as f:
+        tasks = json.load(f)
+    task_dict: Dict[int, dict] = {}
+    for t in tasks:
+        task_dict[int(t["id"])] = t
+    return task_dict
+
+
+# -------------------- CACHE INITIALIZATION --------------------
+def initialize_caches(tasks_dict: Dict[int, dict]):
+    """Pre-compute all predecessor relationships once"""
+    global PREDS_CACHE, GRAPH_CACHE
     
-    def __repr__(self):
-        return f"Chromosome(makespan={self.makespan:.2f}, fitness={self.fitness:.4f})"
+    PREDS_CACHE = {
+        tid: set(int(p) for p in t.get("predecessors", []))
+        for tid, t in tasks_dict.items()
+    }
     
-    def is_valid(self, tasks):
-        """Vérifie si le chromosome contient toutes les opérations"""
-        expected_ops = set()
-        for task in tasks:
-            for op_idx in range(len(task['operations'])):
-                expected_ops.add((task['id'], op_idx))
-        
-        actual_ops = set()
-        for gene in self.genes:
-            if isinstance(gene, OperationGene):
-                actual_ops.add((gene.job_id, gene.op_index))
+    # Build successor graph
+    GRAPH_CACHE = defaultdict(list)
+    for tid, preds in PREDS_CACHE.items():
+        for p in preds:
+            GRAPH_CACHE[p].append(tid)
+
+
+# -------------------- OPTIMIZED REPAIR --------------------
+def precedence_respecting_repair_fast(order: List[int]) -> List[int]:
+    """Optimized O(n) repair using cached predecessors"""
+    placed: Set[int] = set()
+    result: List[int] = []
+    remaining = deque(order)
+    
+    # In-degree tracking for faster checking
+    in_degree = {tid: len(PREDS_CACHE.get(tid, set())) for tid in order}
+    
+    while remaining:
+        progressed = False
+        for _ in range(len(remaining)):
+            tid = remaining.popleft()
+            
+            if in_degree[tid] == 0:
+                result.append(tid)
+                placed.add(tid)
+                progressed = True
+                
+                # Update in-degrees of successors
+                for succ in GRAPH_CACHE.get(tid, []):
+                    if succ not in placed:
+                        in_degree[succ] -= 1
             else:
-                return False, f"Gène invalide: {gene}"
+                remaining.append(tid)
         
-        if len(actual_ops) != len(expected_ops):
-            return False, f"Manque {len(expected_ops) - len(actual_ops)} opérations"
-        
-        if actual_ops != expected_ops:
-            missing = expected_ops - actual_ops
-            return False, f"Opérations manquantes: {missing}"
-        
-        return True, "Chromosome valide"
+        if not progressed and remaining:
+            # Force placement to avoid infinite loop
+            tid = remaining.popleft()
+            result.append(tid)
+            placed.add(tid)
+            in_degree[tid] = 0
+    
+    return result
 
-# ==================== FONCTIONS DE RÉPARATION ====================
-def repair_chromosome(chromosome, tasks):
-    """Répare un chromosome invalide"""
-    # Récupérer toutes les opérations attendues
-    expected_ops = []
-    for task in tasks:
-        task_id = task['id']
-        for op_idx, op_data in enumerate(task['operations']):
-            op_gene = OperationGene(
-                job_id=task_id,
-                op_index=op_idx,
-                machine_id=op_data['machine_id'],
-                duration=op_data['duration']
-            )
-            expected_ops.append(op_gene)
-    
-    # Gènes existants
-    existing_genes = []
-    for gene in chromosome.genes:
-        if isinstance(gene, OperationGene):
-            existing_genes.append(gene)
-    
-    # Trouver les gènes manquants
-    existing_set = set(existing_genes)
-    missing_genes = [g for g in expected_ops if g not in existing_set]
-    
-    # Combiner et compléter
-    repaired_genes = existing_genes + missing_genes
-    
-    # S'assurer qu'on a toutes les opérations
-    if len(repaired_genes) != len(expected_ops):
-        # Ajouter les dernières manquantes
-        for gene in expected_ops:
-            if gene not in repaired_genes:
-                repaired_genes.append(gene)
-    
-    return Chromosome(repaired_genes, chromosome.num_jobs)
 
-# ==================== INITIALISATION ====================
-def create_initial_population(tasks, population_size):
-    """Crée la population avec la représentation correcte"""
-    population = []
-    
-    # Créer toutes les opérations
-    all_operations = []
-    for task in tasks:
-        task_id = task['id']
-        for op_idx, op_data in enumerate(task['operations']):
-            op_gene = OperationGene(
-                job_id=task_id,
-                op_index=op_idx,
-                machine_id=op_data['machine_id'],
-                duration=op_data['duration']
-            )
-            all_operations.append(op_gene)
-    
-    print(f"✓ Création de {len(all_operations)} opérations uniques")
-    
-    for i in range(population_size):
-        genes = all_operations.copy()
-        random.shuffle(genes)
-        chromosome = Chromosome(genes, len(tasks))
-        
-        is_valid, msg = chromosome.is_valid(tasks)
-        if not is_valid:
-            print(f"⚠️ Chromosome {i} invalide: {msg}")
-            chromosome = repair_chromosome(chromosome, tasks)
-        
-        population.append(chromosome)
-    
-    return population
+# -------------------- OPTIMIZED DECODER --------------------
+def decode_priority_schedule_fast(priority: List[int]) -> Tuple[Dict[int,int], Dict[int,int], List[dict], int]:
+    """Fast decoder with minimal allocations"""
+    machine_available_time: Dict[str, int] = {mid: 0 for mid in MACHINE_IDS_GLOBAL}
+    task_end_times: Dict[int, int] = {}
+    op_schedule: List[dict] = []
 
-# ==================== DÉCODAGE ET ÉVALUATION ====================
-def decode_chromosome(chromosome, tasks, task_by_id=None):
-    """Décode correctement le chromosome"""
-    if task_by_id is None:
-        task_by_id, _ = create_task_mapping(tasks)
-    
-    machine_end_times = {}
-    job_end_times = {}
-    job_next_op = {}
-    job_last_end = {}
-    
-    # Initialiser pour chaque job
-    for task in tasks:
-        job_id = task['id']
-        job_end_times[job_id] = 0
-        job_next_op[job_id] = 0
-        job_last_end[job_id] = 0
-    
-    schedule = []
-    scheduled_ops = set()  # Pour suivre les opérations déjà planifiées
-    
-    # Fonction pour vérifier si une opération peut être planifiée
-    def can_schedule(job_id, op_index):
-        return op_index == job_next_op[job_id]
-    
-    # Continuer jusqu'à ce que toutes les opérations soient planifiées
-    total_ops = sum(len(task['operations']) for task in tasks)
-    
-    while len(schedule) < total_ops:
-        progress = False
+    for tid in priority:
+        task = TASKS_DICT_GLOBAL[tid]
         
-        # Parcourir le chromosome
-        for gene in chromosome.genes:
-            if not isinstance(gene, OperationGene):
-                continue
+        # Calculate earliest start
+        earliest_start = 0
+        for pred in PREDS_CACHE.get(tid, set()):
+            earliest_start = max(earliest_start, task_end_times.get(pred, 0))
+        
+        current_time = earliest_start
+        
+        # Schedule operations
+        for idx, op in enumerate(task.get("operations", [])):
+            mid = str(op["machine_id"])
+            dur = int(op["duration"])
             
-            job_id = gene.job_id
-            op_idx = gene.op_index
-            op_key = (job_id, op_idx)
+            start_time = max(current_time, machine_available_time[mid])
+            end_time = start_time + dur
             
-            # Vérifier si déjà planifiée
-            if op_key in scheduled_ops:
-                continue
+            machine_available_time[mid] = end_time
+            current_time = end_time
             
-            # Vérifier si on peut planifier cette opération
-            if not can_schedule(job_id, op_idx):
-                continue
-            
-            # Récupérer les données de l'opération
-            task = task_by_id[job_id]
-            op_data = task['operations'][op_idx]
-            machine_id = op_data['machine_id']
-            duration = op_data['duration']
-            
-            # Initialiser la machine si nécessaire
-            if machine_id not in machine_end_times:
-                machine_end_times[machine_id] = 0
-            
-            # Calculer le temps de début
-            # Dépend de la fin de l'opération précédente du job et de la disponibilité de la machine
-            job_ready_time = job_last_end[job_id]
-            machine_ready_time = machine_end_times[machine_id]
-            start_time = max(job_ready_time, machine_ready_time)
-            end_time = start_time + duration
-            
-            # Planifier l'opération
-            schedule.append({
-                'job_id': job_id,
-                'operation_index': op_idx,
-                'machine_id': machine_id,
-                'start': start_time,
-                'end': end_time,
-                'duration': duration
+            op_schedule.append({
+                "task_id": tid,
+                "op_index": idx,
+                "machine_id": mid,
+                "start": start_time,
+                "end": end_time,
             })
-            
-            # Mettre à jour les états
-            scheduled_ops.add(op_key)
-            job_next_op[job_id] += 1
-            job_last_end[job_id] = end_time
-            machine_end_times[machine_id] = end_time
-            
-            progress = True
-            break  # Revenir au début de la boucle
         
-        # Si aucune opération n'a pu être planifiée, forcer la planification
-        if not progress:
-            for gene in chromosome.genes:
-                if not isinstance(gene, OperationGene):
-                    continue
-                
-                job_id = gene.job_id
-                op_idx = gene.op_index
-                op_key = (job_id, op_idx)
-                
-                if op_key in scheduled_ops:
-                    continue
-                
-                # Forcer la planification de cette opération
-                task = task_by_id[job_id]
-                op_data = task['operations'][op_idx]
-                machine_id = op_data['machine_id']
-                duration = op_data['duration']
-                
-                if machine_id not in machine_end_times:
-                    machine_end_times[machine_id] = 0
-                
-                # Trouver le temps de fin du prédécesseur
-                predecessor_end = 0
-                for op in schedule:
-                    if op['job_id'] == job_id and op['operation_index'] == op_idx - 1:
-                        predecessor_end = op['end']
-                        break
-                
-                start_time = max(machine_end_times[machine_id], predecessor_end)
-                end_time = start_time + duration
-                
-                schedule.append({
-                    'job_id': job_id,
-                    'operation_index': op_idx,
-                    'machine_id': machine_id,
-                    'start': start_time,
-                    'end': end_time,
-                    'duration': duration
-                })
-                
-                scheduled_ops.add(op_key)
-                job_next_op[job_id] = max(job_next_op[job_id], op_idx + 1)
-                job_last_end[job_id] = max(job_last_end.get(job_id, 0), end_time)
-                machine_end_times[machine_id] = end_time
-                
+        task_end_times[tid] = current_time
+
+    makespan = max(task_end_times.values()) if task_end_times else 0
+    return {}, task_end_times, op_schedule, makespan
+
+
+# -------------------- OPTIMIZED GA OPERATORS --------------------
+def ppx_crossover_fast(parent_a: List[int], parent_b: List[int]) -> List[int]:
+    """Fast PPX using numpy and cached predecessors"""
+    child: List[int] = []
+    placed: Set[int] = set()
+    
+    ia = ib = 0
+    len_a, len_b = len(parent_a), len(parent_b)
+    
+    while len(placed) < len(parent_a):
+        # Try parent A
+        while ia < len_a:
+            a = parent_a[ia]
+            ia += 1
+            if a not in placed and PREDS_CACHE.get(a, set()) <= placed:
+                child.append(a)
+                placed.add(a)
                 break
+        
+        if len(placed) == len(parent_a):
+            break
+        
+        # Try parent B
+        while ib < len_b:
+            b = parent_b[ib]
+            ib += 1
+            if b not in placed and PREDS_CACHE.get(b, set()) <= placed:
+                child.append(b)
+                placed.add(b)
+                break
+        
+        # If stuck, force add first available
+        if len(child) == len(placed) - 1:  # No progress in this iteration
+            for tid in parent_a:
+                if tid not in placed:
+                    child.append(tid)
+                    placed.add(tid)
+                    break
     
-    # Calculer le makespan
-    makespan = max(job_last_end.values()) if job_last_end else 0
-    return schedule, makespan
+    return child
 
-def evaluate_fitness(chromosome, tasks, task_by_id=None):
-    """Évalue le fitness d'un chromosome"""
-    is_valid, msg = chromosome.is_valid(tasks)
-    if not is_valid:
-        chromosome = repair_chromosome(chromosome, tasks)
-    
-    schedule, makespan = decode_chromosome(chromosome, tasks, task_by_id)
-    chromosome.makespan = makespan
-    chromosome.fitness = 1.0 / makespan if makespan > 0 else 0
-    return chromosome.fitness
 
-# ==================== OPÉRATEURS GÉNÉTIQUES ====================
-def tournament_selection(population, tournament_size=3):
-    """Sélection par tournoi"""
-    tournament = random.sample(population, tournament_size)
-    return max(tournament, key=lambda x: x.fitness)
+def mutate_swap_fast(order: List[int], mutation_rate: float = 0.2) -> List[int]:
+    """Fast mutation without full repair if possible"""
+    if random.random() >= mutation_rate:
+        return order
+    
+    out = order[:]
+    i, j = random.sample(range(len(out)), 2)
+    
+    # Check if swap would violate precedence
+    ti, tj = out[i], out[j]
+    
+    # Simple check: if neither is predecessor of the other, swap is safe
+    if tj not in PREDS_CACHE.get(ti, set()) and ti not in PREDS_CACHE.get(tj, set()):
+        out[i], out[j] = out[j], out[i]
+        return out
+    
+    # Otherwise do swap and repair
+    out[i], out[j] = out[j], out[i]
+    return precedence_respecting_repair_fast(out)
 
-def order_crossover(parent1, parent2):
-    """Order Crossover (OX)"""
-    size = len(parent1.genes)
-    if size < 2:
-        return deepcopy(parent1), deepcopy(parent2)
-    
-    point1 = random.randint(0, size - 2)
-    point2 = random.randint(point1 + 1, size)
-    
-    child1_genes = [None] * size
-    child2_genes = [None] * size
-    
-    # Copier les segments
-    for i in range(point1, point2):
-        child1_genes[i] = parent1.genes[i]
-        child2_genes[i] = parent2.genes[i]
-    
-    # Remplir le reste
-    def fill_child(child_genes, parent, segment_set):
-        pos = point2
-        for i in range(size):
-            idx = (point2 + i) % size
-            gene = parent.genes[idx]
-            if gene not in segment_set:
-                child_genes[pos % size] = gene
-                pos += 1
-    
-    fill_child(child1_genes, parent2, set(parent1.genes[point1:point2]))
-    fill_child(child2_genes, parent1, set(parent2.genes[point1:point2]))
-    
-    # Réparer si nécessaire
-    child1 = Chromosome(child1_genes, parent1.num_jobs)
-    child2 = Chromosome(child2_genes, parent2.num_jobs)
-    
-    return child1, child2
 
-def swap_mutation(chromosome):
-    """Mutation par échange de deux gènes"""
-    size = len(chromosome.genes)
-    if size < 2:
-        return chromosome
-    
-    pos1 = random.randint(0, size - 1)
-    pos2 = random.randint(0, size - 1)
-    
-    while pos2 == pos1:
-        pos2 = random.randint(0, size - 1)
-    
-    chromosome.genes[pos1], chromosome.genes[pos2] = \
-        chromosome.genes[pos2], chromosome.genes[pos1]
-    
-    return chromosome
+# -------------------- PARALLEL EVALUATION --------------------
+def eval_order_parallel(order: List[int]) -> int:
+    """Wrapper for parallel evaluation"""
+    _, _, _, ms = decode_priority_schedule_fast(order)
+    return ms
 
-# ==================== ALGORITHME GÉNÉTIQUE ====================
-def genetic_algorithm(tasks, population_size=50, crossover_rate=0.8, 
-                     mutation_rate=0.1, num_generations=100, elitism_count=2):
-    """Algorithme génétique pour résoudre le JSSP"""
-    
-    print(f"\n{'='*60}")
-    print(f"ALGORITHME GÉNÉTIQUE - JOB SHOP SCHEDULING")
-    print(f"{'='*60}")
-    
-    total_operations = sum(len(task['operations']) for task in tasks)
-    print(f"Nombre de jobs: {len(tasks)}")
-    print(f"Total opérations: {total_operations}")
-    print(f"Taille population: {population_size}")
-    print(f"Générations: {num_generations}")
-    
-    task_by_id, job_ids = create_task_mapping(tasks)
-    population = create_initial_population(tasks, population_size)
-    
-    # Évaluation initiale
-    for individual in population:
-        evaluate_fitness(individual, tasks, task_by_id)
-    
-    best_fitness_history = []
-    avg_fitness_history = []
-    best_solution = None
-    
-    start_time = time.time()
-    
-    for generation in range(num_generations):
-        # Trier par fitness
-        population.sort(key=lambda x: x.fitness, reverse=True)
-        
-        # Mettre à jour la meilleure solution
-        if best_solution is None or population[0].fitness > best_solution.fitness:
-            best_solution = deepcopy(population[0])
-        
-        # Historique
-        best_fitness = population[0].fitness
-        avg_fitness = sum(ind.fitness for ind in population) / len(population)
-        best_fitness_history.append(best_fitness)
-        avg_fitness_history.append(avg_fitness)
-        
-        # Affichage
-        if generation % 10 == 0 or generation == num_generations - 1:
-            elapsed = time.time() - start_time
-            print(f"Gen {generation:4d}: Makespan = {population[0].makespan:8.2f}, "
-                  f"Fitness = {best_fitness:.6f}, Time = {elapsed:.1f}s")
-        
-        # Nouvelle population (élitisme)
-        new_population = deepcopy(population[:elitism_count])
-        
-        # Reproduction
-        while len(new_population) < population_size:
-            parent1 = tournament_selection(population)
-            parent2 = tournament_selection(population)
-            
-            if random.random() < crossover_rate:
-                child1, child2 = order_crossover(parent1, parent2)
-            else:
-                child1 = deepcopy(parent1)
-                child2 = deepcopy(parent2)
-            
-            # Mutation
-            if random.random() < mutation_rate:
-                child1 = swap_mutation(child1)
-            if random.random() < mutation_rate:
-                child2 = swap_mutation(child2)
-            
-            # Réparation si nécessaire
-            is_valid1, _ = child1.is_valid(tasks)
-            if not is_valid1:
-                child1 = repair_chromosome(child1, tasks)
-            
-            is_valid2, _ = child2.is_valid(tasks)
-            if not is_valid2:
-                child2 = repair_chromosome(child2, tasks)
-            
-            # Ajout à la nouvelle population
-            if len(new_population) < population_size:
-                new_population.append(child1)
-            if len(new_population) < population_size:
-                new_population.append(child2)
-        
-        population = new_population[:population_size]
-        
-        # Réévaluation
-        for individual in population:
-            evaluate_fitness(individual, tasks, task_by_id)
-    
-    total_time = time.time() - start_time
-    
-    # Vérifier la meilleure solution finale
-    population.sort(key=lambda x: x.fitness, reverse=True)
-    if population[0].fitness > best_solution.fitness:
-        best_solution = deepcopy(population[0])
-    
-    print(f"\n{'='*60}")
-    print(f"RÉSULTATS FINAUX")
-    print(f"{'='*60}")
-    print(f"Meilleur makespan: {best_solution.makespan:.2f}")
-    print(f"Fitness: {best_solution.fitness:.6f}")
-    print(f"Temps d'exécution: {total_time:.1f} secondes")
-    print(f"{'='*60}")
-    
-    return best_solution, best_fitness_history, avg_fitness_history, job_ids
 
-# ==================== VALIDATION ====================
-def validate_solution(chromosome, tasks):
-    """Valide rigoureusement une solution"""
-    print("\n=== VALIDATION DE LA SOLUTION ===")
-    
-    # 1. Vérifier la représentation
-    is_valid, msg = chromosome.is_valid(tasks)
-    print(f"1. Validité chromosome: {is_valid} ({msg})")
-    
-    if not is_valid:
-        return False
-    
-    # 2. Décoder et vérifier les contraintes
-    task_by_id, _ = create_task_mapping(tasks)
-    schedule, makespan = decode_chromosome(chromosome, tasks, task_by_id)
-    
-    print(f"2. Nombre d'opérations planifiées: {len(schedule)}")
-    print(f"3. Makespan calculé: {makespan}")
-    
-    # 3. Vérifier toutes les opérations sont planifiées
-    expected_count = sum(len(task['operations']) for task in tasks)
-    if len(schedule) != expected_count:
-        print(f"❌ ERREUR: {len(schedule)}/{expected_count} opérations planifiées")
-        return False
-    
-    # 4. Vérifier les précédences
-    job_ops = {}
-    for op in schedule:
-        job_id = op['job_id']
-        if job_id not in job_ops:
-            job_ops[job_id] = []
-        job_ops[job_id].append(op)
-    
-    precedence_violation = False
-    for job_id, ops in job_ops.items():
-        ops.sort(key=lambda x: x['operation_index'])
-        for i in range(1, len(ops)):
-            if ops[i]['start'] < ops[i-1]['end']:
-                print(f"❌ ERREUR précédence Job {job_id}: op{i-1} fin {ops[i-1]['end']}, op{i} début {ops[i]['start']}")
-                precedence_violation = True
-    
-    if precedence_violation:
-        return False
-    
-    print("✓ Solution VALIDE")
-    return True
+def init_worker(tasks_dict, machine_ids):
+    """Initialize global variables in each worker process"""
+    global TASKS_DICT_GLOBAL, MACHINE_IDS_GLOBAL
+    TASKS_DICT_GLOBAL = tasks_dict
+    MACHINE_IDS_GLOBAL = machine_ids
+    initialize_caches(tasks_dict)
 
-# ==================== VISUALISATION ====================
-def plot_gantt_chart(chromosome, tasks, job_ids, filename='gantt_chart_genetic.png'):
-    """Génère un diagramme de Gantt pour la solution"""
-    try:
-        task_by_id, _ = create_task_mapping(tasks)
-        schedule, makespan = decode_chromosome(chromosome, tasks, task_by_id)
-        
-        if not os.path.exists(RESULTS_DIR):
-            os.makedirs(RESULTS_DIR)
-        
-        filepath = os.path.join(RESULTS_DIR, filename)
-        
-        fig, ax = plt.subplots(figsize=(20, 12))
-        
-        # Couleurs
-        num_jobs = len(job_ids)
-        if num_jobs <= 20:
-            colors = plt.cm.tab20(np.linspace(0, 1, num_jobs))
+
+# -------------------- ADAPTIVE GA --------------------
+def run_adaptive_ga(tasks_dict: Dict[int, dict], machine_ids: List[str],
+                    seed: int | None = None,
+                    pop_size: int = 50, 
+                    generations: int = 200,
+                    cx_rate: float = 0.9, 
+                    mut_rate: float = 0.2,
+                    use_parallel: bool = True,
+                    early_stop_patience: int = 30) -> Tuple[Dict[int,int], Dict[int,int], List[dict], int, List[int]]:
+    
+    global TASKS_DICT_GLOBAL, MACHINE_IDS_GLOBAL
+    TASKS_DICT_GLOBAL = tasks_dict
+    MACHINE_IDS_GLOBAL = machine_ids
+    
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    initialize_caches(tasks_dict)
+    task_ids = list(tasks_dict.keys())
+    
+    print(f"🚀 Starting Adaptive GA: {len(task_ids)} tasks, {len(machine_ids)} machines")
+    print(f"   Pop size: {pop_size}, Generations: {generations}, Parallel: {use_parallel}")
+
+    # Initialize population with diverse topological sorts
+    def generate_initial():
+        shuffled = task_ids[:]
+        random.shuffle(shuffled)
+        return precedence_respecting_repair_fast(shuffled)
+    
+    population: List[List[int]] = [generate_initial() for _ in range(pop_size)]
+
+    # Parallel pool setup - only use for large datasets
+    pool = None
+    should_use_parallel = use_parallel and len(task_ids) > 500
+    if should_use_parallel:
+        num_workers = max(1, min(4, cpu_count() - 1))  # Cap at 4 workers
+        pool = Pool(processes=num_workers, initializer=init_worker, initargs=(tasks_dict, machine_ids))
+        print(f"   Using {num_workers} parallel workers")
+    else:
+        if use_parallel:
+            print(f"   Parallel disabled (< 500 tasks, overhead too high)")
+
+    def eval_population(pop: List[List[int]]) -> List[int]:
+        if should_use_parallel and pool:
+            return pool.map(eval_order_parallel, pop, chunksize=max(1, len(pop)//num_workers))
         else:
-            colors = plt.cm.rainbow(np.linspace(0, 1, num_jobs))
-        
-        job_to_index = {job_id: idx for idx, job_id in enumerate(job_ids)}
-        
-        # Machines
-        machines = sorted(set(op['machine_id'] for op in schedule))
-        machine_to_y = {machine: i for i, machine in enumerate(machines)}
-        
-        # Dessiner les opérations
-        for operation in schedule:
-            job_id = operation['job_id']
-            job_index = job_to_index[job_id]
-            machine_id = operation['machine_id']
-            start = operation['start']
-            duration = operation['duration']
-            
-            y_pos = machine_to_y[machine_id]
-            
-            rect = mpatches.Rectangle(
-                (start, y_pos - 0.4), 
-                duration, 
-                0.8,
-                facecolor=colors[job_index % len(colors)],
-                edgecolor='black',
-                linewidth=0.5,
-                alpha=0.8
-            )
-            ax.add_patch(rect)
-            
-            # Texte si assez grand
-            if duration > makespan * 0.02:
-                label = str(job_id).replace('job_', 'J')
-                ax.text(start + duration/2, y_pos, label,
-                        ha='center', va='center', fontsize=7, fontweight='bold')
-        
-        ax.set_xlim(0, makespan * 1.01)
-        ax.set_ylim(-0.5, len(machines) - 0.5)
-        ax.set_xlabel('Temps', fontsize=14, fontweight='bold')
-        ax.set_ylabel('Machines', fontsize=14, fontweight='bold')
-        ax.set_title(f'Diagramme de Gantt - Makespan: {makespan:.2f} (Génétique)', 
-                     fontsize=16, fontweight='bold', pad=20)
-        
-        ax.set_yticks(range(len(machines)))
-        ax.set_yticklabels([str(m) for m in machines], fontsize=10)
-        ax.grid(axis='x', alpha=0.3, linestyle='--')
-        
-        plt.tight_layout()
-        plt.savefig(filepath, dpi=300, bbox_inches='tight')
-        plt.show()
-        print(f"✓ Diagramme sauvegardé: {filepath}")
-        
-    except Exception as e:
-        print(f"❌ Erreur lors de la création du diagramme: {e}")
+            return [eval_order_parallel(order) for order in pop]
 
-# ==================== EXÉCUTION PRINCIPALE ====================
-def main():
-    """Fonction principale"""
-    print("="*60)
-    print("JOB SHOP SCHEDULING - ALGORITHME GÉNÉTIQUE")
-    print("="*60)
+    # Initial evaluation
+    fitnesses = eval_population(population)
+    scored: List[Tuple[List[int], int]] = list(zip(population, fitnesses))
+    scored.sort(key=lambda x: x[1])
     
-    # Charger les données
-    tasks = load_tasks('tasks_small.json')
-    if not tasks:
-        print("❌ Aucune tâche chargée. Vérifiez le fichier tasks.json")
+    best_order, best_makespan = scored[0]
+    print(f"   Initial best makespan: {best_makespan} ({best_makespan/60:.1f}h)")
+
+    # Evolution with adaptive parameters and early stopping
+    no_improvement_count = 0
+    best_history = [best_makespan]
+    
+    start_time = time.perf_counter()
+    
+    for gen in range(generations):
+        new_pop: List[List[int]] = []
+        
+        # Elitism: keep top 10%
+        elite_count = max(1, pop_size // 10)
+        for i in range(elite_count):
+            new_pop.append(scored[i][0])
+        
+        # Generate offspring
+        while len(new_pop) < pop_size:
+            # Tournament selection
+            p1 = min(random.sample(scored, 3), key=lambda x: x[1])[0]
+            p2 = min(random.sample(scored, 3), key=lambda x: x[1])[0]
+            
+            # Crossover
+            if random.random() < cx_rate:
+                child = ppx_crossover_fast(p1, p2)
+            else:
+                child = p1[:]
+            
+            # Adaptive mutation rate
+            adaptive_mut = mut_rate * (1.5 if no_improvement_count > 10 else 1.0)
+            child = mutate_swap_fast(child, mutation_rate=adaptive_mut)
+            
+            new_pop.append(child)
+        
+        # Evaluate new population
+        fitnesses = eval_population(new_pop)
+        scored = list(zip(new_pop, fitnesses))
+        scored.sort(key=lambda x: x[1])
+        
+        current_best_makespan = scored[0][1]
+        
+        # Update best solution
+        if current_best_makespan < best_makespan:
+            best_makespan = current_best_makespan
+            best_order = scored[0][0]
+            no_improvement_count = 0
+            print(f"   Gen {gen+1}: NEW BEST = {best_makespan} ({best_makespan/60:.1f}h) ⭐")
+        else:
+            no_improvement_count += 1
+        
+        best_history.append(best_makespan)
+        
+        # Progress report every 10 generations for small datasets, 20 for large
+        report_interval = 10 if len(task_ids) < 1000 else 20
+        if (gen + 1) % report_interval == 0:
+            elapsed = time.perf_counter() - start_time
+            print(f"   Gen {gen+1}/{generations}: Best={best_makespan} ({best_makespan/60:.1f}h), "
+                  f"Avg={np.mean(fitnesses):.0f}, No improvement={no_improvement_count}, "
+                  f"Time={elapsed:.1f}s")
+        
+        # Early stopping
+        if no_improvement_count >= early_stop_patience:
+            print(f"   🛑 Early stopping at generation {gen+1} (no improvement for {early_stop_patience} gens)")
+            break
+
+    if pool:
+        pool.close()
+        pool.join()
+
+    # Final decode
+    starts, ends, ops, _ = decode_priority_schedule_fast(best_order)
+    
+    total_time = time.perf_counter() - start_time
+    print(f"✅ GA Complete: Best makespan = {best_makespan} ({best_makespan/60:.2f}h) in {total_time:.1f}s")
+    
+    return starts, ends, ops, best_makespan, best_order
+
+
+# -------------------- VISUALIZATION --------------------
+def visualize_gantt_optimized(op_schedule: List[dict], machine_order: List[str] | None = None, 
+                             out_path: Path = Path("gantt_ga.png"), title: str = "GA Schedule",
+                             sample_rate: int = 1) -> None:
+    """Optimized Gantt chart with sampling for large schedules"""
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+    except ImportError:
+        print("matplotlib not installed; skipping Gantt chart.")
         return
+
+    # Sample operations if too many
+    if len(op_schedule) > 10000:
+        print(f"   Sampling {len(op_schedule)} operations (showing every {sample_rate}th operation)")
+        op_schedule = op_schedule[::sample_rate]
+
+    ops_machines = [op["machine_id"] for op in op_schedule]
+    machines = list(machine_order or [])
+    seen = set(machines)
+    for m in ops_machines:
+        if m not in seen:
+            machines.append(m)
+            seen.add(m)
+
+    y_index = {m: i for i, m in enumerate(machines)}
+    time_max = max((op["end"] for op in op_schedule), default=0)
+
+    fig_w = max(12, min(20, time_max / 100))
+    fig_h = max(6, min(16, len(machines) * 0.4))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     
-    # Exécuter l'algorithme génétique
-    best_solution, best_history, avg_history, job_ids = genetic_algorithm(
-        tasks,
-        population_size=50,      # Taille raisonnable
-        num_generations=100,     # Suffisant pour convergence
-        crossover_rate=0.8,
-        mutation_rate=0.1,
-        elitism_count=2
+    # Use a simpler color scheme for performance
+    num_tasks = max((op["task_id"] for op in op_schedule), default=0) + 1
+    colors = plt.cm.tab20(np.linspace(0, 1, 20))
+
+    for op in op_schedule:
+        mid = op["machine_id"]
+        tid = op["task_id"]
+        start = op["start"]
+        end = op["end"]
+        dur = end - start
+        y = y_index[mid]
+        
+        color = colors[tid % 20]
+        ax.broken_barh([(start, dur)], (y - 0.4, 0.8), 
+                      facecolors=color, edgecolor="black", 
+                      linewidth=0.5, alpha=0.85)
+        
+        # Only label if bar is wide enough
+        if dur > time_max * 0.01:
+            ax.text(start + dur / 2, y, f"T{tid}", 
+                   va="center", ha="center", color="white", 
+                   fontsize=6, clip_on=True, fontweight='bold')
+
+    ax.set_yticks(range(len(machines)))
+    ax.set_yticklabels(machines, fontsize=8)
+    ax.set_xlabel("Time (minutes)", fontsize=10)
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.set_xlim(0, max(1, time_max))
+    ax.grid(axis="x", linestyle="--", alpha=0.3)
+    
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120, bbox_inches='tight')
+    plt.close(fig)
+    print(f"   💾 Saved Gantt chart to {out_path}")
+
+
+# -------------------- MAIN --------------------
+def main():
+    parser = argparse.ArgumentParser(description="Optimized GA scheduler for large datasets")
+    parser.add_argument("--machines", type=Path, default=Path("machines.json"))
+    parser.add_argument("--tasks", type=Path, default=Path("tasks_large.json"))
+    parser.add_argument("--out", type=Path, default=Path("gantt_ga_optimized.png"))
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--pop-size", type=int, default=50, help="Population size (50-100 for large datasets)")
+    parser.add_argument("--generations", type=int, default=200, help="Max generations (200-500 for large datasets)")
+    parser.add_argument("--cx-rate", type=float, default=0.9)
+    parser.add_argument("--mut-rate", type=float, default=0.2)
+    parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing")
+    parser.add_argument("--early-stop", type=int, default=30, help="Early stopping patience")
+    args = parser.parse_args()
+
+    print("="*60)
+    print("🔧 OPTIMIZED GA SCHEDULER FOR LARGE DATASETS")
+    print("="*60)
+
+    machine_ids = load_machines(args.machines)
+    tasks = load_tasks(args.tasks)
+    
+    print(f"📊 Loaded: {len(tasks)} tasks, {len(machine_ids)} machines")
+
+    t0 = time.perf_counter()
+    starts, ends, ops, ms, order = run_adaptive_ga(
+        tasks, machine_ids,
+        seed=args.seed,
+        pop_size=args.pop_size,
+        generations=args.generations,
+        cx_rate=args.cx_rate,
+        mut_rate=args.mut_rate,
+        use_parallel=not args.no_parallel,
+        early_stop_patience=args.early_stop
+    )
+    dt = time.perf_counter() - t0
+    
+    print("="*60)
+    print(f"📈 FINAL RESULTS:")
+    print(f"   Makespan: {ms} minutes ({ms/60:.2f} hours)")
+    print(f"   Runtime: {dt:.2f} seconds")
+    print(f"   Operations: {len(ops)}")
+    print("="*60)
+    
+    # Save results to JSON
+    results_path = Path("results_optimized.json")
+    with results_path.open("w") as f:
+        json.dump({
+            "makespan_minutes": ms,
+            "makespan_hours": ms/60,
+            "runtime_seconds": dt,
+            "num_tasks": len(tasks),
+            "num_operations": len(ops),
+            "priority_order": order,
+            "parameters": {
+                "pop_size": args.pop_size,
+                "generations": args.generations,
+                "cx_rate": args.cx_rate,
+                "mut_rate": args.mut_rate,
+                "seed": args.seed
+            }
+        }, f, indent=2)
+    print(f"   💾 Saved results to {results_path}")
+    
+    # Visualize (with sampling if needed)
+    sample_rate = max(1, len(ops) // 5000)
+    visualize_gantt_optimized(
+        ops,
+        machine_order=machine_ids,
+        out_path=args.out,
+        title=f"Optimized GA Schedule ({len(tasks)} tasks, {ms/60:.1f}h, {dt:.0f}s)",
+        sample_rate=sample_rate
     )
     
-    # Valider la solution
-    is_valid = validate_solution(best_solution, tasks)
-    
-    if is_valid:
-        print(f"\n✅ SOLUTION VALIDE: makespan = {best_solution.makespan:.2f}")
-        print(f"   (À comparer avec Branch & Bound: 2843)")
-        
-        # Statistiques
-        task_by_id, _ = create_task_mapping(tasks)
-        schedule, _ = decode_chromosome(best_solution, tasks, task_by_id)
-        
-        machine_work = {}
-        for op in schedule:
-            machine = op['machine_id']
-            machine_work[machine] = machine_work.get(machine, 0) + op['duration']
-        
-        total_work = sum(machine_work.values())
-        print(f"\n📊 Statistiques:")
-        print(f"   • Utilisation machines: {total_work / (best_solution.makespan * len(machine_work)) * 100:.1f}%")
-        print(f"   • Durée totale travail: {total_work:.0f}")
-        
-        # Vérifier la cohérence
-        total_work_branch = 8214  # De votre output Branch & Bound
-        if abs(total_work - total_work_branch) > 10:
-            print(f"⚠️  ATTENTION: Travail total différent")
-            print(f"   • Génétique: {total_work:.0f}")
-            print(f"   • Branch & Bound: {total_work_branch}")
-        
-        # Générer le diagramme de Gantt
-        plot_gantt_chart(best_solution, tasks, job_ids)
-        
-    else:
-        print(f"\n❌ SOLUTION INVALIDE")
-        print("   Vérifiez le décodage du chromosome")
+    current, peak = tracemalloc.get_traced_memory()
+    print(f"   💾 Memory: Current={current/1_000_000:.1f}MB, Peak={peak/1_000_000:.1f}MB")
+    print("="*60)
+    tracemalloc.stop()
+
 
 if __name__ == "__main__":
     main()

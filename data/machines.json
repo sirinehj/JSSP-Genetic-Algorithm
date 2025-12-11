@@ -1,0 +1,46 @@
+[
+  {
+    "id": "machine_001",
+    "name": "Hydraulic Press"
+  },
+  {
+    "id": "machine_002",
+    "name": "CNC Lathe"
+  },
+  {
+    "id": "machine_003",
+    "name": "3D Printer"
+  },
+  {
+    "id": "machine_004",
+    "name": "Laser Cutter"
+  },
+  {
+    "id": "machine_005",
+    "name": "Welding Robot"
+  },
+  {
+    "id": "machine_006",
+    "name": "Assembly Line Conveyor"
+  },
+  {
+    "id": "machine_007",
+    "name": "Packaging Machine"
+  },
+  {
+    "id": "machine_008",
+    "name": "Industrial Mixer"
+  },
+  {
+    "id": "machine_009",
+    "name": "Injection Molding Machine"
+  },
+  {
+    "id": "machine_010",
+    "name": "Forklift"
+  },
+    {
+    "id": "machine_011",
+    "name": "Robotic Arm"
+  }
+]
