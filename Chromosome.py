@@ -14,12 +14,13 @@ tracemalloc.start()
 
 # -------------------- GLOBAL CACHE --------------------
 PREDS_CACHE = {}
-GRAPH_CACHE = {}
+GRAPH_CACHE = {} 
 TASKS_DICT_GLOBAL = None
 MACHINE_IDS_GLOBAL = None
 
 
 # -------------------- IO HELPERS --------------------
+#Charger la configuration des machines depuis JSON
 def load_machines(machines_path: Path) -> List[str]:
     if not machines_path.exists():
         raise FileNotFoundError(f"machines.json not found at: {machines_path}")
@@ -36,7 +37,7 @@ def load_machines(machines_path: Path) -> List[str]:
         raise ValueError("No machine IDs found in machines.json.")
     return machine_ids
 
-
+#Charger toutes les tâches avec leurs opérations et prédecesseurs
 def load_tasks(tasks_path: Path) -> Dict[int, dict]:
     if not tasks_path.exists():
         raise FileNotFoundError(f"tasks file not found at: {tasks_path}")
@@ -49,6 +50,7 @@ def load_tasks(tasks_path: Path) -> Dict[int, dict]:
 
 
 # -------------------- CACHE INITIALIZATION --------------------
+#Précaculer TOUTES les relations de précédence une seule fois pour éviter de recalculer à chaque évaluation
 def initialize_caches(tasks_dict: Dict[int, dict]):
     """Pre-compute all predecessor relationships once"""
     global PREDS_CACHE, GRAPH_CACHE
@@ -66,13 +68,14 @@ def initialize_caches(tasks_dict: Dict[int, dict]):
 
 
 # -------------------- OPTIMIZED REPAIR --------------------
+# Obtenir un ordre valide de taches qui respecte toutes les contraintes, prêt à être évalué par le GA.
 def precedence_respecting_repair_fast(order: List[int]) -> List[int]:
     """Optimized O(n) repair using cached predecessors"""
     placed: Set[int] = set()
     result: List[int] = []
     remaining = deque(order)
     
-    # In-degree tracking for faster checking
+    # suivre combien de prédécesseurs restent à placer
     in_degree = {tid: len(PREDS_CACHE.get(tid, set())) for tid in order}
     
     while remaining:
@@ -103,6 +106,7 @@ def precedence_respecting_repair_fast(order: List[int]) -> List[int]:
 
 
 # -------------------- OPTIMIZED DECODER --------------------
+#Simuler l'exécution des tâches dans l'ordre donné et calculer le temps total (makespan)
 def decode_priority_schedule_fast(priority: List[int]) -> Tuple[Dict[int,int], Dict[int,int], List[dict], int]:
     """Fast decoder with minimal allocations"""
     machine_available_time: Dict[str, int] = {mid: 0 for mid in MACHINE_IDS_GLOBAL}
@@ -137,58 +141,89 @@ def decode_priority_schedule_fast(priority: List[int]) -> Tuple[Dict[int,int], D
                 "start": start_time,
                 "end": end_time,
             })
-        
+#moment où chaque tâche se termine
         task_end_times[tid] = current_time
 
+#max(task_end_times.values):temps total de fin de toutes les tâches,
     makespan = max(task_end_times.values()) if task_end_times else 0
     return {}, task_end_times, op_schedule, makespan
 
 
 # -------------------- OPTIMIZED GA OPERATORS --------------------
-def ppx_crossover_fast(parent_a: List[int], parent_b: List[int]) -> List[int]:
-    """Fast PPX using numpy and cached predecessors"""
+def ppx_crossover_improved(parent_a: List[int], parent_b: List[int]) -> List[int]:
+    """Improved PPX crossover with better precedence handling"""
     child: List[int] = []
     placed: Set[int] = set()
     
-    ia = ib = 0
-    len_a, len_b = len(parent_a), len(parent_b)
+    # Use both parents as starting points
+    tasks_set = set(parent_a) | set(parent_b)
     
-    while len(placed) < len(parent_a):
-        # Try parent A
-        while ia < len_a:
-            a = parent_a[ia]
-            ia += 1
-            if a not in placed and PREDS_CACHE.get(a, set()) <= placed:
-                child.append(a)
-                placed.add(a)
-                break
+    # Create priority queues from both parents
+    queue_a = deque(parent_a)
+    queue_b = deque(parent_b)
+    
+    max_attempts = len(tasks_set) * 3
+    attempts = 0
+    
+    while len(placed) < len(tasks_set) and attempts < max_attempts:
+        attempts += 1
         
-        if len(placed) == len(parent_a):
-            break
+        # Try from parent A first
+        found = False
+        while queue_a and not found:
+            task = queue_a.popleft()
+            if task not in placed:
+                preds = PREDS_CACHE.get(task, set())
+                if preds.issubset(placed):
+                    child.append(task)
+                    placed.add(task)
+                    found = True
+                else:
+                    queue_a.append(task)  # Put back for later
+                    # Try a limited number of times before moving on
+                    if len(queue_a) > len(tasks_set) * 2:
+                        break
         
-        # Try parent B
-        while ib < len_b:
-            b = parent_b[ib]
-            ib += 1
-            if b not in placed and PREDS_CACHE.get(b, set()) <= placed:
-                child.append(b)
-                placed.add(b)
-                break
+        if not found and queue_b:
+            # Try from parent B
+            while queue_b and not found:
+                task = queue_b.popleft()
+                if task not in placed:
+                    preds = PREDS_CACHE.get(task, set())
+                    if preds.issubset(placed):
+                        child.append(task)
+                        placed.add(task)
+                        found = True
+                    else:
+                        queue_b.append(task)
+                        if len(queue_b) > len(tasks_set) * 2:
+                            break
         
-        # If stuck, force add first available
-        if len(child) == len(placed) - 1:  # No progress in this iteration
-            for tid in parent_a:
-                if tid not in placed:
-                    child.append(tid)
-                    placed.add(tid)
-                    break
+        if not found:
+            # Find any available task
+            for task in tasks_set:
+                if task not in placed:
+                    preds = PREDS_CACHE.get(task, set())
+                    if preds.issubset(placed):
+                        child.append(task)
+                        placed.add(task)
+                        found = True
+                        break
+    
+    # À la fin, si certaines tâches restent encore non placées → elles sont ajoutées avec une heuristique.
+    remaining = [t for t in tasks_set if t not in placed]
+    if remaining:
+        # Sort by number of remaining predecessors (heuristic)
+        remaining.sort(key=lambda t: len(PREDS_CACHE.get(t, set()) - placed))
+        child.extend(remaining)
+        if len(remaining) > 5:  # Only warn if many tasks remain
+            print(f"   ⚠️ Added {len(remaining)} remaining tasks (minimal)")
     
     return child
-
-
+#permettre au GA d’évaluer plusieurs individus en parallèle sans recalculer les caches à chaque fois.
 def mutate_swap_fast(order: List[int], mutation_rate: float = 0.2) -> List[int]:
     """Fast mutation without full repair if possible"""
-    if random.random() >= mutation_rate:
+    if random.random() >= mutation_rate or len(order) < 2:
         return order
     
     out = order[:]
@@ -204,16 +239,35 @@ def mutate_swap_fast(order: List[int], mutation_rate: float = 0.2) -> List[int]:
     
     # Otherwise do swap and repair
     out[i], out[j] = out[j], out[i]
-    return precedence_respecting_repair_fast(out)
+    
+    # Si le swap risque de violer la précédence, swap anyway then repare order with precedence_respecting_repair_fast
+    try:
+        return precedence_respecting_repair_fast(out)
+    except Exception as e:
+        print(f"   ⚠️ Repair failed: {e}, returning original order")
+        return order
+    
+def validate_schedule_order(order: List[int]) -> bool:
+    """Validate that an order respects precedence constraints"""
+    placed = set()
+    for task in order:
+        preds = PREDS_CACHE.get(task, set())
+        if not preds.issubset(placed):
+            print(f"   ❌ Invalid order: Task {task} has predecessors {preds} not in {placed}")
+            return False
+        placed.add(task)
+    return True
 
 
 # -------------------- PARALLEL EVALUATION --------------------
+#→ Sert de wrapper pour ne récupérer que le makespan.
+#→ Cela permet de noter la qualité (fitness) d’un individu dans le GA.
 def eval_order_parallel(order: List[int]) -> int:
     """Wrapper for parallel evaluation"""
     _, _, _, ms = decode_priority_schedule_fast(order)
     return ms
 
-
+#permettre au GA d’évaluer plusieurs individus en parallèle sans recalculer les caches à chaque fois.
 def init_worker(tasks_dict, machine_ids):
     """Initialize global variables in each worker process"""
     global TASKS_DICT_GLOBAL, MACHINE_IDS_GLOBAL
@@ -223,6 +277,24 @@ def init_worker(tasks_dict, machine_ids):
 
 
 # -------------------- ADAPTIVE GA --------------------
+#- tasks_dict: données des tâches
+#- machine_ids: liste des machines
+#- seed: graine aléatoire pour reproductibilité (42 par défaut)
+#- pop_size: taille population (50 par défaut)
+#- generations: nombre max de générations (200 par défaut)
+#- cx_rate: taux de crossover (0.9 = 90% par défaut)
+#- mut_rate: taux de mutation (0.2 = 20% par défaut)
+#- use_parallel: utiliser parallélisme (True par défaut)
+#- early_stop_patience: arrêt si pas amélioration pendant X générations (30 par défaut)
+#Boucle sur les générations:
+#   . Élitisme (garder top 10%)
+#   . Sélection par tournoi (choisir 3, prendre meilleur)
+#   . Crossover (90% de chance)
+#   . Mutation (taux adaptatif)
+#   . Évaluation nouvelle population
+#   . Mise à jour meilleure solution
+#   . Arrêt prématuré si stagnation
+
 def run_adaptive_ga(tasks_dict: Dict[int, dict], machine_ids: List[str],
                     seed: int | None = None,
                     pop_size: int = 50, 
@@ -301,14 +373,17 @@ def run_adaptive_ga(tasks_dict: Dict[int, dict], machine_ids: List[str],
             
             # Crossover
             if random.random() < cx_rate:
-                child = ppx_crossover_fast(p1, p2)
+                child = ppx_crossover_improved(p1, p2)
             else:
                 child = p1[:]
             
             # Adaptive mutation rate
             adaptive_mut = mut_rate * (1.5 if no_improvement_count > 10 else 1.0)
             child = mutate_swap_fast(child, mutation_rate=adaptive_mut)
-            
+            if len(child) != len(task_ids):
+                print(f"   ⚠️ Child length mismatch: {len(child)} vs {len(task_ids)}, regenerating")
+                child = generate_initial()
+
             new_pop.append(child)
         
         # Evaluate new population
@@ -318,7 +393,7 @@ def run_adaptive_ga(tasks_dict: Dict[int, dict], machine_ids: List[str],
         
         current_best_makespan = scored[0][1]
         
-        # Update best solution
+        # Update best solution / Stagnation: nbr générations consécutives où aucune amélioration done.
         if current_best_makespan < best_makespan:
             best_makespan = current_best_makespan
             best_order = scored[0][0]
@@ -337,11 +412,11 @@ def run_adaptive_ga(tasks_dict: Dict[int, dict], machine_ids: List[str],
                   f"Avg={np.mean(fitnesses):.0f}, No improvement={no_improvement_count}, "
                   f"Time={elapsed:.1f}s")
         
-        # Early stopping
+        # GA stops quand il n'apprend plus
         if no_improvement_count >= early_stop_patience:
             print(f"   🛑 Early stopping at generation {gen+1} (no improvement for {early_stop_patience} gens)")
             break
-
+#gagner du temps et éviter de continuer inutilement quand le GA a convergé.
     if pool:
         pool.close()
         pool.join()
@@ -427,7 +502,7 @@ def visualize_gantt_optimized(op_schedule: List[dict], machine_order: List[str] 
 def main():
     parser = argparse.ArgumentParser(description="Optimized GA scheduler for large datasets")
     parser.add_argument("--machines", type=Path, default=Path("machines.json"))
-    parser.add_argument("--tasks", type=Path, default=Path("tasks_large.json"))
+    parser.add_argument("--tasks", type=Path, default=Path("tasks_small.json"))
     parser.add_argument("--out", type=Path, default=Path("gantt_ga_optimized.png"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--pop-size", type=int, default=50, help="Population size (50-100 for large datasets)")
